@@ -3,7 +3,9 @@ name = "lumen2"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy>=2.4.2",
+]
 
 [project.optional-dependencies]
 dev = ["ruff"]
