@@ -47,11 +47,23 @@ DEFAULT_CONTROL_PARAMS = {
 
 
 def original_frequency_grid() -> np.ndarray:
-    """Return the frequency grid used in the original MATLAB script."""
+    """返回原 MATLAB 脚本使用的频率采样网格。
+
+    用法：
+    1. 直接调用得到一维频率数组（Hz）。
+    2. 该网格用于与原始仿真配置保持一致。
+    """
     return np.arange(1.93523e14, 1.93558e14 + 0.5 * 0.00000025e14, 0.00000025e14)
 
 
 def _merge_params(control_params=None, fixed_params=None):
+    """合并默认参数、固定参数和可调参数。
+
+    用法：
+    1. `fixed_params` 用于覆盖结构常量。
+    2. `control_params` 用于覆盖第一层可控相位参数。
+    3. 返回可直接传给 `simulate_ramzi` 的参数字典。
+    """
     merged = dict(DEFAULT_FIXED_PARAMS)
     merged.update(DEFAULT_CONTROL_PARAMS)
     if fixed_params is not None:
@@ -62,6 +74,13 @@ def _merge_params(control_params=None, fixed_params=None):
 
 
 def _sort_and_crop(lambda_nm, arrays, wavelength_window_nm=(1549.9, 1550.2)):
+    """按波长升序排序并按窗口裁剪数组。
+
+    用法：
+    1. 传入波长数组和同长度数据字典 `arrays`。
+    2. `wavelength_window_nm=None` 时仅排序不裁剪。
+    3. 返回排序/裁剪后的波长和数据字典。
+    """
     order = np.argsort(lambda_nm)
     lambda_sorted = lambda_nm[order]
     arrays_sorted = {name: value[order] for name, value in arrays.items()}
@@ -82,20 +101,13 @@ def simulate_clean_spectrum(
     observe_port="C2",
     wavelength_window_nm=(1549.9, 1550.2),
 ):
-    """Simulate the clean spectral response.
+    """仿真无噪声光谱。
 
-    Parameters
-    ----------
-    control_params : dict or None
-        The first-layer controllable theoretical parameters. Supported keys are
-        thetai, thetao, fait, faib, fai1, fai2, fai3, fai4.
-    fixed_params : dict or None
-        Structure parameters kept fixed during control optimization.
-    observe_port : str
-        Either "C1" or "C2". The original MATLAB script focuses on C2.
-    wavelength_window_nm : tuple[float, float] or None
-        Cropping window in nanometers. The default follows the plotted range in
-        the original MATLAB script.
+    用法：
+    1. `control_params` 传入待调相位参数（如 `thetai`、`thetao` 等）。
+    2. `fixed_params` 传入固定结构参数；未传时使用默认值。
+    3. `observe_port` 选择输出端口 `"C1"` 或 `"C2"`。
+    4. 返回波长、线性功率、dB 功率及完整参数信息。
     """
     params = _merge_params(control_params=control_params, fixed_params=fixed_params)
     result = simulate_ramzi(f=original_frequency_grid(), **params)
@@ -138,13 +150,12 @@ def add_noise_to_power_spectrum(
     baseline_offset=0.0,
     power_floor=1e-12,
 ):
-    """Add simple measurement noise in the linear-power domain.
+    """在线性功率域加入测量噪声。
 
-    The noisy spectrum is generated as
-
-        P_noisy = P_clean * (1 + eps_rel) + eps_add + baseline_offset,
-
-    where eps_rel and eps_add are zero-mean Gaussian noises.
+    用法：
+    1. 输入 `clean_power` 为无噪功率数组。
+    2. 通过 `relative_noise_std`、`additive_noise_std` 和 `baseline_offset` 控制噪声。
+    3. 返回 `(noisy_power, noisy_db)`，并使用 `power_floor` 防止对数下溢。
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -169,7 +180,13 @@ def simulate_noisy_spectrum(
     baseline_offset=0.0,
     seed=None,
 ):
-    """Simulate a noisy spectral response from the first-layer theoretical parameters."""
+    """基于控制参数仿真带噪声光谱。
+
+    用法：
+    1. 先内部调用 `simulate_clean_spectrum` 生成理想光谱。
+    2. 再调用 `add_noise_to_power_spectrum` 注入噪声。
+    3. 返回含 clean/noisy 数据和噪声配置的结果字典。
+    """
     rng = np.random.default_rng(seed)
     clean = simulate_clean_spectrum(
         control_params=control_params,

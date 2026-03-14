@@ -1,12 +1,20 @@
 import numpy as np
 from scipy.optimize import least_squares
 
-from ramzi_spectrum_simulator import (
-    CONTROL_PARAM_NAMES,
-    DEFAULT_CONTROL_PARAMS,
-    simulate_clean_spectrum,
-    simulate_noisy_spectrum,
-)
+try:
+    from .ramzi_spectrum_simulator import (
+        CONTROL_PARAM_NAMES,
+        DEFAULT_CONTROL_PARAMS,
+        simulate_clean_spectrum,
+        simulate_noisy_spectrum,
+    )
+except ImportError:
+    from ramzi_spectrum_simulator import (
+        CONTROL_PARAM_NAMES,
+        DEFAULT_CONTROL_PARAMS,
+        simulate_clean_spectrum,
+        simulate_noisy_spectrum,
+    )
 
 
 PHASE_LOWER_BOUND = -np.pi
@@ -14,15 +22,33 @@ PHASE_UPPER_BOUND = np.pi
 
 
 def wrap_phase(x):
+    """将相位包裹到 [-pi, pi) 区间。
+
+    用法：
+    1. 输入标量或数组 `x`（单位弧度）。
+    2. 返回同形状数组，便于相位优化与误差统计。
+    """
     x = np.asarray(x, dtype=float)
     return (x + np.pi) % (2.0 * np.pi) - np.pi
 
 
 def pack_control_params(control_params):
+    """把控制参数字典打包为向量。
+
+    用法：
+    1. 传入包含 `CONTROL_PARAM_NAMES` 所有键的字典。
+    2. 返回按固定顺序排列的一维 `numpy` 向量。
+    """
     return np.array([control_params[name] for name in CONTROL_PARAM_NAMES], dtype=float)
 
 
 def unpack_control_params(vector):
+    """把控制参数向量还原为字典。
+
+    用法：
+    1. 传入参数向量（可超出主值区间）。
+    2. 函数内部会先做相位包裹，再返回参数字典。
+    """
     vector = wrap_phase(np.asarray(vector, dtype=float))
     return {name: float(value) for name, value in zip(CONTROL_PARAM_NAMES, vector)}
 
@@ -33,6 +59,13 @@ UPPER_BOUNDS = np.full(DEFAULT_VECTOR.shape, PHASE_UPPER_BOUND, dtype=float)
 
 
 def interpolate_simulated_power(wavelength_nm, control_vector, fixed_params=None, observe_port="C2"):
+    """在测量波长点上插值仿真功率。
+
+    用法：
+    1. 输入目标波长数组 `wavelength_nm` 与控制向量 `control_vector`。
+    2. 内部调用 `simulate_clean_spectrum` 生成全谱。
+    3. 返回插值后的仿真功率数组，用于与测量值对齐比较。
+    """
     control_params = unpack_control_params(control_vector)
     sim = simulate_clean_spectrum(
         control_params=control_params,
@@ -49,6 +82,13 @@ def interpolate_simulated_power(wavelength_nm, control_vector, fixed_params=None
 
 
 def fit_affine_scale(sim_power, measured_power):
+    """拟合仿真功率到测量功率的仿射映射。
+
+    用法：
+    1. 输入仿真功率 `sim_power` 与测量功率 `measured_power`。
+    2. 通过最小二乘求解 `measured ~= scale * sim + offset`。
+    3. 返回 `(scale, offset)`。
+    """
     sim_power = np.asarray(sim_power, dtype=float)
     measured_power = np.asarray(measured_power, dtype=float)
     A = np.column_stack([sim_power, np.ones_like(sim_power)])
@@ -66,6 +106,14 @@ def build_residual_vector(
     fit_scale_and_offset=True,
     slope_weight=0.15,
 ):
+    """构建优化残差向量。
+
+    用法：
+    1. 根据 `control_vector` 生成并插值仿真功率。
+    2. 可选拟合线性幅度/偏置 (`fit_scale_and_offset`)。
+    3. 同时拼接功率残差与斜率残差（由 `slope_weight` 控制）。
+    4. 返回给 `scipy.optimize.least_squares` 使用的一维残差。
+    """
     sim_power = interpolate_simulated_power(
         wavelength_nm=wavelength_nm,
         control_vector=control_vector,
@@ -107,6 +155,12 @@ def objective_cost(
     fit_scale_and_offset=True,
     slope_weight=0.15,
 ):
+    """计算二范数目标函数值（0.5 * ||residual||^2）。
+
+    用法：
+    1. 输入与 `build_residual_vector` 相同参数。
+    2. 返回标量损失，便于评估不同解的优劣。
+    """
     residual = build_residual_vector(
         control_vector=control_vector,
         wavelength_nm=wavelength_nm,
@@ -125,6 +179,13 @@ def generate_initial_guesses(
     center=None,
     perturbation_std=0.35,
 ):
+    """生成多起点优化的初始猜测集合。
+
+    用法：
+    1. `n_starts` 控制初值数量，`seed` 控制随机性复现。
+    2. 以 `center` 为中心随机扰动，并混入全局均匀采样。
+    3. 返回包裹到 [-pi, pi) 的向量列表。
+    """
     rng = np.random.default_rng(seed)
     if center is None:
         center = DEFAULT_VECTOR
@@ -141,11 +202,23 @@ def generate_initial_guesses(
 
 
 def circular_mean(vectors):
+    """计算角度向量的圆统计均值。
+
+    用法：
+    1. 输入形状为 `(n_samples, n_params)` 的角度数组。
+    2. 返回每个参数维度的圆均值（弧度）。
+    """
     vectors = np.asarray(vectors, dtype=float)
     return np.arctan2(np.mean(np.sin(vectors), axis=0), np.mean(np.cos(vectors), axis=0))
 
 
 def circular_std(vectors):
+    """计算角度向量的圆统计标准差。
+
+    用法：
+    1. 输入形状为 `(n_samples, n_params)` 的角度数组。
+    2. 返回每个参数维度的圆标准差（弧度）。
+    """
     vectors = np.asarray(vectors, dtype=float)
     R = np.sqrt(np.mean(np.cos(vectors), axis=0) ** 2 + np.mean(np.sin(vectors), axis=0) ** 2)
     R = np.clip(R, 1e-12, 1.0)
@@ -167,6 +240,13 @@ def identify_control_params_from_power_spectrum(
     elite_cost_abs_margin=0.1,
     verbose=False,
 ):
+    """从线性功率光谱反演控制参数。
+
+    用法：
+    1. 输入测量波长 `wavelength_nm` 与测量功率 `measured_power`。
+    2. 通过 `n_starts` 多起点最小二乘搜索最优参数。
+    3. 返回最优解、精英集合统计、拟合曲线与每次运行记录。
+    """
     wavelength_nm = np.asarray(wavelength_nm, dtype=float)
     measured_power = np.asarray(measured_power, dtype=float)
 
@@ -289,6 +369,13 @@ def identify_control_params_from_db_spectrum(
     power_floor=1e-12,
     **kwargs,
 ):
+    """从 dB 光谱反演控制参数。
+
+    用法：
+    1. 输入 `measured_db`（dB）与波长数组。
+    2. 内部先转换到线性功率，再调用功率域识别函数。
+    3. 其余参数通过 `**kwargs` 透传。
+    """
     measured_power = np.maximum(10.0 ** (np.asarray(measured_db, dtype=float) / 10.0), power_floor)
     return identify_control_params_from_power_spectrum(
         wavelength_nm=wavelength_nm,
@@ -298,6 +385,12 @@ def identify_control_params_from_db_spectrum(
 
 
 def summarize_parameter_error(estimated_params, reference_params):
+    """汇总估计参数与参考参数的包裹误差。
+
+    用法：
+    1. 输入两个参数字典（估计值与参考真值）。
+    2. 返回每个参数在弧度和角度下的包裹误差统计。
+    """
     summary = {}
     for name in CONTROL_PARAM_NAMES:
         delta = wrap_phase(estimated_params[name] - reference_params[name])

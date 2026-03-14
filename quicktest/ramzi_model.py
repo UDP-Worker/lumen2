@@ -2,18 +2,11 @@ import numpy as np
 
 
 def ring_block(theta, phi_bias, phi_rt, tau):
-    """Single resonant sub-block transfer function.
+    """计算单个谐振子块的复传输函数。
 
-    Parameters
-    ----------
-    theta : float
-        Internal phase parameter of the resonant block.
-    phi_bias : float
-        Static phase bias.
-    phi_rt : np.ndarray
-        Frequency-dependent round-trip phase.
-    tau : float
-        Amplitude transmission factor for one round trip.
+    用法：
+    1. 传入标量 `theta`、`phi_bias`、`tau`，以及随频率变化的 `phi_rt` 数组。
+    2. 返回与 `phi_rt` 同形状的复数响应，可用于级联多个谐振块。
     """
     num = (np.exp(1j * theta) - 1.0) / 2.0 - tau * np.exp(1j * (phi_bias + theta + phi_rt))
     den = 1.0 - tau * (1.0 - np.exp(1j * theta)) * np.exp(1j * (phi_rt + phi_bias)) / 2.0
@@ -47,7 +40,13 @@ def simulate_ramzi(
     L4=3000e-6,
     c=3e8,
 ):
-    """Simulate the RAMZI-like spectral response from the MATLAB script."""
+    """仿真 RAMZI 结构在频域下的响应。
+
+    用法：
+    1. 不传 `f` 时使用默认频率网格；也可传入自定义频率数组。
+    2. 通过关键字参数覆盖耦合系数、相位和结构参数。
+    3. 返回包含波长、功率和 dB 光谱等结果的字典。
+    """
     if f is None:
         f = np.arange(1.93523e14, 1.93558e14 + 0.5 * 0.00000025e14, 0.00000025e14)
 
