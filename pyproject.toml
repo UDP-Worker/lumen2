@@ -2,10 +2,11 @@
 name = "lumen2"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "matlabengine",
+    "matlabengine==25.1.2",
     "numpy>=2.4.2",
+    "pyyaml>=6.0.2",
     "scipy>=1.17.1",
     "scipy-stubs~=1.17.1",
 ]

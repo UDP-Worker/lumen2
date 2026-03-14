@@ -6,6 +6,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from ..matlab_bridge import (
     add_matlab_paths,
+    close_matlab_engine,
     matlab_engine_session,
     matlab_struct_get,
     start_matlab_engine,
@@ -33,7 +34,7 @@ def disconnect_voltage_source(engine: Any, *, stop_engine: bool = False) -> None
         engine.silicon_extreme_api("disconnect", nargout=1)
     finally:
         if stop_engine:
-            engine.quit()
+            close_matlab_engine(engine)
 
 
 def configure_channel_limits(
