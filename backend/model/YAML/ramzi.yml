@@ -41,6 +41,20 @@ parameters:
       value: -1.9471591266949537
       bounds: [-3.141592653589793, 3.141592653589793]
 
+  constraints:
+    - name: shared_outer_phase
+      lhs: thetai
+      operator: "=="
+      rhs: thetao
+    - name: balanced_ring_bias
+      lhs: "fait + faib"
+      operator: "=="
+      rhs: 0.0
+    - name: ring_phase_order
+      lhs: fai2
+      operator: "<="
+      rhs: fai1
+
   fixed:
     E1:
       real: 0.0

@@ -157,13 +157,17 @@ function resolved = localResolveConfig(config)
     end
 
     if isfield(config, 'parameters') && isfield(config.parameters, 'tunable')
-        resolved.parameters.tunable = localResolveParameterBlock( ...
-            config.parameters.tunable, defaults.parameters.tunable, true);
+        [resolved.parameters.tunable, resolved.parameters.tunable_specs] = localResolveTunableParameterBlock( ...
+            config.parameters.tunable, defaults.parameters.tunable, defaults.parameters.tunable_specs);
     end
 
     if isfield(config, 'parameters') && isfield(config.parameters, 'fixed')
         resolved.parameters.fixed = localResolveParameterBlock( ...
             config.parameters.fixed, defaults.parameters.fixed, false);
+    end
+
+    if isfield(config, 'parameters') && isfield(config.parameters, 'constraints')
+        resolved.parameters.constraints = localNormalizeConstraintCollection(config.parameters.constraints);
     end
 end
 
@@ -205,6 +209,55 @@ function defaults = localDefaultConfig()
         'L4', 3000e-6, ...
         'c', 3e8 ...
     );
+    defaults.parameters.tunable_specs = localBuildDefaultTunableSpecs(defaults.parameters.tunable);
+    defaults.parameters.constraints = {};
+end
+
+function specs = localBuildDefaultTunableSpecs(values)
+    specs = struct();
+    names = fieldnames(values);
+    for idx = 1:numel(names)
+        name = names{idx};
+        specs.(name) = struct( ...
+            'value', double(values.(name)), ...
+            'bounds', [] ...
+        );
+    end
+end
+
+function [resolvedValues, resolvedSpecs] = localResolveTunableParameterBlock(inputBlock, defaults, defaultSpecs)
+    if ~isstruct(inputBlock)
+        error('ramzi:InvalidParameterBlock', 'Parameter blocks must be MATLAB structs.');
+    end
+
+    resolvedValues = defaults;
+    resolvedSpecs = defaultSpecs;
+
+    inputNames = fieldnames(inputBlock);
+    for idx = 1:numel(inputNames)
+        name = inputNames{idx};
+        if ~isfield(defaults, name)
+            error('ramzi:UnknownParameter', 'Unknown parameter: %s', name);
+        end
+
+        candidate = inputBlock.(name);
+        bounds = defaultSpecs.(name).bounds;
+
+        if isstruct(candidate) && isfield(candidate, 'value')
+            resolvedValue = localResolveScalar(candidate.value);
+            if isfield(candidate, 'bounds')
+                bounds = localResolveBounds(candidate.bounds, name);
+            end
+        else
+            resolvedValue = localResolveScalar(candidate);
+        end
+
+        resolvedValues.(name) = resolvedValue;
+        resolvedSpecs.(name) = struct( ...
+            'value', resolvedValue, ...
+            'bounds', bounds ...
+        );
+    end
 end
 
 function resolved = localResolveParameterBlock(inputBlock, defaults, expectValueField)
@@ -244,6 +297,44 @@ function value = localResolveScalar(candidate)
     end
 
     value = double(candidate);
+end
+
+function bounds = localResolveBounds(candidate, parameterName)
+    if isempty(candidate)
+        bounds = [];
+        return;
+    end
+
+    if ~(isnumeric(candidate) && isvector(candidate) && numel(candidate) == 2)
+        error('ramzi:InvalidBounds', 'Bounds for %s must be a numeric 2-element vector.', parameterName);
+    end
+
+    bounds = reshape(double(candidate), 1, []);
+    if bounds(1) > bounds(2)
+        error('ramzi:InvalidBounds', 'Bounds for %s must satisfy lower <= upper.', parameterName);
+    end
+end
+
+function constraints = localNormalizeConstraintCollection(candidate)
+    if isempty(candidate)
+        constraints = {};
+        return;
+    end
+
+    if iscell(candidate)
+        constraints = reshape(candidate, 1, []);
+        return;
+    end
+
+    if isstruct(candidate)
+        constraints = cell(1, numel(candidate));
+        for idx = 1:numel(candidate)
+            constraints{idx} = candidate(idx);
+        end
+        return;
+    end
+
+    error('ramzi:InvalidConstraints', 'parameters.constraints must be a struct array or a cell array.');
 end
 
 function value = localGetNumericField(source, fieldName, defaultValue)
