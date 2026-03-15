@@ -99,8 +99,21 @@ function result = wavelength_sweep(varargin)
     fprintf(osa, [':trac:x? tr', settings.channel]);
     wavelengthText = fscanf(osa);
 
-    rawPowerDbm = localParseAsciiTrace(powerText, settings.point_count);
-    wavelengthNm = localParseAsciiTrace(wavelengthText, settings.point_count) * 1e9;
+    rawPowerDbm = localParseAsciiTrace(powerText);
+    wavelengthNm = localParseAsciiTrace(wavelengthText) * 1e9;
+
+    if numel(rawPowerDbm) ~= numel(wavelengthNm)
+        error('wavelength_sweep:TraceLengthMismatch', ...
+            'The OSA returned %d power points and %d wavelength points.', ...
+            numel(rawPowerDbm), numel(wavelengthNm));
+    end
+
+    if numel(rawPowerDbm) ~= settings.point_count
+        warning('wavelength_sweep:UnexpectedPointCount', ...
+            'Expected %d points from the OSA but received %d. Using the instrument data as-is.', ...
+            settings.point_count, numel(rawPowerDbm));
+    end
+
     reportedPowerDbm = rawPowerDbm;
 
     if settings.normalization

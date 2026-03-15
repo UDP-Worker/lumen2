@@ -108,16 +108,16 @@ def _start_shared_engine_fallback(matlab_engine: Any, original_error: UnicodeDec
     )
 
     deadline = time.monotonic() + 60.0
+    launcher_exited = False
     try:
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise RuntimeError(
-                    "MATLAB exited before a shared engine session became available."
-                ) from original_error
+                launcher_exited = True
 
             if share_name in matlab_engine.find_matlab():
                 engine = matlab_engine.connect_matlab(share_name)
-                _MANAGED_ENGINE_PROCESSES[id(engine)] = process
+                if process.poll() is None:
+                    _MANAGED_ENGINE_PROCESSES[id(engine)] = process
                 return engine
 
             time.sleep(1.0)
@@ -130,6 +130,10 @@ def _start_shared_engine_fallback(matlab_engine: Any, original_error: UnicodeDec
     if process.poll() is None:
         process.kill()
     _wait_for_managed_process(process)
+    if launcher_exited:
+        raise RuntimeError(
+            "MATLAB exited before a shared engine session became discoverable."
+        ) from original_error
     raise RuntimeError(
         "Timed out while starting a shared MATLAB session. "
         "Set the MATLAB_EXE environment variable if MATLAB is installed in a nonstandard location."
@@ -137,9 +141,12 @@ def _start_shared_engine_fallback(matlab_engine: Any, original_error: UnicodeDec
 
 
 def _build_shared_startup_tokens(share_name: str) -> list[str]:
-    tokens = ["-nodesktop", "-nosplash"]
+    tokens: list[str] = []
+    if os.name == "nt":
+        tokens.append("-wait")
+    tokens.extend(["-nodesktop", "-nosplash"])
     tokens.append("-r")
-    tokens.append(f"matlab.engine.shareEngine('{share_name}')")
+    tokens.append(f"matlab.engine.shareEngine('{share_name}'); while true, pause(1); end")
     return tokens
 
 

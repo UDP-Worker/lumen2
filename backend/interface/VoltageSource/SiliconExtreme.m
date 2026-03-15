@@ -156,7 +156,12 @@ classdef SiliconExtreme < handle
             for idx = 1:numel(channels)
                 voltages(idx) = obj.getV(channels(idx));
                 currents(idx) = obj.getI(channels(idx));
-                powers(idx) = obj.getP(channels(idx));
+                try
+                    powers(idx) = obj.getP(channels(idx));
+                catch
+                    % Some firmware revisions do not implement per-channel power reads.
+                    powers(idx) = NaN;
+                end
             end
 
             snapshot = struct( ...
@@ -171,9 +176,9 @@ classdef SiliconExtreme < handle
     methods (Access = private)
         function value = readNumeric(obj, commandText, quantityName)
             response = obj.query(commandText);
-            value = str2double(response);
+            value = sscanf(response, '%f', 1);
 
-            if isnan(value)
+            if isempty(value) || isnan(value)
                 error('SiliconExtreme:InvalidResponse', ...
                     'Failed to read %s. Raw response: %s', quantityName, response);
             end
