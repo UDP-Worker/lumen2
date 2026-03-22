@@ -1,0 +1,90 @@
+version: 1
+model:
+  name: ramzi
+  entrypoint: ramzi
+  matlab_dir: backend/model/MATLAB
+simulation:
+  wavelength_nm:
+    start: 1549.923
+    stop: 1550.2032
+    step: 0.0002
+outputs:
+  observe_port: C2
+parameters:
+  tunable:
+    fai1:
+      value: -0.1470265361880023
+      bounds:
+      - -3.141592653589793
+      - 3.141592653589793
+    fai2:
+      value: -2.1494776935861366
+      bounds:
+      - -3.141592653589793
+      - 3.141592653589793
+    fai3:
+      value: -0.1627344994559513
+      bounds:
+      - -3.141592653589793
+      - 3.141592653589793
+    fai4:
+      value: -1.9471591266949537
+      bounds:
+      - -3.141592653589793
+      - 3.141592653589793
+    theta1:
+      value: -1.9540706305328512
+      bounds:
+      - -3.141592653589793
+      - 3.141592653589793
+    theta2:
+      value: -2.293362637120549
+      bounds:
+      - -3.141592653589793
+      - 3.141592653589793
+    theta3:
+      value: -1.9540706305328512
+      bounds:
+      - -3.141592653589793
+      - 3.141592653589793
+    theta4:
+      value: -2.293362637120549
+      bounds:
+      - -3.141592653589793
+      - 3.141592653589793
+  constraints:
+  - name: balanced_ring_bias
+    lhs: fait + faib
+    operator: ==
+    rhs: 0.0
+  fixed:
+    E1:
+      real: 0.0
+      imag: 0.0
+    E2:
+      real: 1.0
+      imag: 0.0
+    Ki: 0.5
+    Ko: 0.5
+    thetai: 1.5707963267948966
+    thetao: 1.5707963267948966
+    faib: -1.5550883635269477
+    fait: 1.5550883635269477
+    Alfadb: 15.0
+    ng: 4.3
+    L1: 0.00035
+    L2: 0.003
+    L3: 0.00035
+    L4: 0.003
+    c: 300000000.0
+calibration:
+  zero_config:
+    tunable:
+      fai1: -0.147026536188
+      fai2: -2.14947769359
+      fai3: -0.162734499456
+      fai4: -1.94715912669
+      theta1: -1.95407063053
+      theta2: -2.29336263712
+      theta3: -1.95407063053
+      theta4: -2.29336263712

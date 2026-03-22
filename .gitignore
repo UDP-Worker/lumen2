@@ -3,6 +3,8 @@
 Thumbs.db
 
 agent.md
+# 日志
+backend/calibrate/data
 
 # Python
 __pycache__/
