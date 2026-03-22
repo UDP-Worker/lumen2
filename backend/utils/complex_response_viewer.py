@@ -4,10 +4,8 @@ import argparse
 import colorsys
 import logging
 import math
-import re
 import tkinter as tk
 from dataclasses import dataclass, field
-from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Mapping, Sequence
 
@@ -50,8 +48,8 @@ class CurveGroup:
 
 @dataclass(frozen=True, slots=True)
 class SelectionRecord:
-    wavelength_nm: float
-    baseline_db: float
+    through_wavelength_nm: float
+    extinction_wavelength_nm: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +58,6 @@ class ViewerSelectionResult:
     visible_groups: tuple[str, ...]
     x_limits_nm: tuple[float, float]
     y_limits_db: tuple[float, float]
-    shared_baseline_db: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,8 +154,9 @@ def select_extinction_reference(
     groups: Sequence[CurveGroup] | Mapping[str, CurveGroup],
     *,
     title: str = "Select Extinction Reference",
+    logger: logging.Logger | None = None,
 ) -> SelectionRecord:
-    result = _run_viewer(groups, mode="single", shared_baseline=False, title=title)
+    result = _run_viewer(groups, mode="single", shared_baseline=False, title=title, logger=logger)
     return result.selections[GLOBAL_TARGET]
 
 
@@ -167,8 +165,15 @@ def select_variable_targets(
     *,
     title: str = "Select Calibration Targets",
     shared_baseline: bool = True,
+    logger: logging.Logger | None = None,
 ) -> ViewerSelectionResult:
-    return _run_viewer(groups, mode="per-variable", shared_baseline=shared_baseline, title=title)
+    return _run_viewer(
+        groups,
+        mode="per-variable",
+        shared_baseline=shared_baseline,
+        title=title,
+        logger=logger,
+    )
 
 
 def edit_tunable_parameters(
@@ -190,7 +195,7 @@ def edit_tunable_parameters(
     ).show()
 
 
-def _load_tunable_editor_matplotlib() -> tuple[Any, Any, Any]:
+def _load_matplotlib_tk() -> tuple[Any, Any, Any]:
     global _MATPLOTLIB_TK_IMPORTS
     if _MATPLOTLIB_TK_IMPORTS is not None:
         return _MATPLOTLIB_TK_IMPORTS
@@ -453,7 +458,7 @@ class _TunableEditor:
         self.parameter_canvas.itemconfigure(self.parameter_window, width=event.width)
 
     def _build_matplotlib_plot(self, plot_surface: ttk.Frame, toolbar_wrap: ttk.Frame) -> None:
-        Figure, FigureCanvasTkAgg, NavigationToolbar2Tk = _load_tunable_editor_matplotlib()
+        Figure, FigureCanvasTkAgg, NavigationToolbar2Tk = _load_matplotlib_tk()
 
         self.figure = Figure(figsize=(10.0, 7.5), dpi=100)
         self.axes = self.figure.add_subplot(111)
@@ -740,7 +745,6 @@ class _TunableEditor:
             return
         self.figure_canvas.draw()
         self._log_canvas_state(reason)
-        self._export_canvas_snapshot(reason)
 
     def _cancel_pending_render_log(self) -> None:
         if self._pending_render_log_id is None:
@@ -886,36 +890,7 @@ class _TunableEditor:
             detailed_lines[:5],
         )
 
-    def _export_canvas_snapshot(self, reason: str) -> None:
-        if self.logger is None or self.figure is None:
-            return
-
-        snapshot_path = self._snapshot_path(reason)
-        if snapshot_path is None:
-            return
-
-        try:
-            self.figure.savefig(snapshot_path, dpi=160, bbox_inches="tight")
-        except Exception:  # pragma: no cover - best-effort debug path
-            self._log_exception(f"Failed to export figure snapshot for reason={reason}")
-            return
-
-        self.logger.info("Figure snapshot [%s] exported to %s", reason, snapshot_path)
-
-    def _snapshot_path(self, reason: str) -> Path | None:
-        if self.logger is None:
-            return None
-
-        for handler in self.logger.handlers:
-            if not isinstance(handler, logging.FileHandler):
-                continue
-            log_path = Path(handler.baseFilename)
-            safe_reason = re.sub(r"[^0-9A-Za-z_-]+", "_", reason.strip()) or "snapshot"
-            return log_path.with_name(f"{log_path.stem}_{safe_reason}.png")
-        return None
-
-
-class _Viewer:
+class _MatplotlibViewer:
     def __init__(
         self,
         groups: Sequence[CurveGroup],
@@ -923,19 +898,45 @@ class _Viewer:
         mode: str,
         shared_baseline: bool,
         title: str,
+        logger: logging.Logger | None = None,
     ) -> None:
         self.groups = _normalize_groups(groups)
         self.mode = mode
-        self.shared_baseline = shared_baseline
+        self.shared_baseline_requested = shared_baseline
+        self.logger = logger
         self.colors = {
             group.name: group.color or PALETTE[index % len(PALETTE)]
             for index, group in enumerate(self.groups)
         }
-        self.targets = [GLOBAL_TARGET] if mode == "single" else [group.name for group in self.groups]
+        if mode == "single":
+            self.targets = [GLOBAL_TARGET]
+            self.target_category_by_name: dict[str, str] = {GLOBAL_TARGET: GLOBAL_TARGET}
+            self.targets_by_category: dict[str, list[str]] = {GLOBAL_TARGET: [GLOBAL_TARGET]}
+            self.target_categories = (GLOBAL_TARGET,)
+        else:
+            self.targets = [group.name for group in self.groups]
+            self.target_category_by_name = {}
+            self.targets_by_category = {}
+            for group in self.groups:
+                category = str(group.metadata.get("source_bundle", group.name))
+                self.target_category_by_name[group.name] = category
+                self.targets_by_category.setdefault(category, []).append(group.name)
+            self.target_categories = tuple(self.targets_by_category.keys())
         self.default_range = _default_range(self.groups)
         self.range = self.default_range
         self.result: ViewerSelectionResult | None = None
         self.cancelled = False
+        self._syncing_limits = False
+        self.figure: Any | None = None
+        self.axes: Any | None = None
+        self.figure_canvas: Any | None = None
+        self.toolbar: Any | None = None
+        self.cursor_vline: Any | None = None
+        self.cursor_hline: Any | None = None
+        self.cursor_annotation: Any | None = None
+        self.controls_canvas: tk.Canvas | None = None
+        self.controls_inner: ttk.Frame | None = None
+        self.controls_window: int | None = None
 
         try:
             self.root = tk.Tk()
@@ -949,39 +950,49 @@ class _Viewer:
 
         self.visible_vars = {group.name: tk.BooleanVar(value=True) for group in self.groups}
         self.active_target = tk.StringVar(value=self.targets[0])
+        self.active_category = tk.StringVar(value=self.target_category_by_name[self.targets[0]])
+        self.selection_slot = tk.StringVar(value="through")
         self.cursor_x = tk.StringVar(value="--")
         self.cursor_y = tk.StringVar(value="--")
-        self.wavelength_var = tk.StringVar()
-        self.baseline_var = tk.StringVar()
-        self.shared_baseline_var = tk.StringVar()
+        self.through_wavelength_var = tk.StringVar()
+        self.extinction_wavelength_var = tk.StringVar()
         self.status = tk.StringVar(
-            value="Move for crosshair. Drag with left mouse to zoom. Right click resets zoom."
+            value=(
+                "Select 'Through' or 'Extinction' on the left, then left-click the plot to "
+                "record that wavelength. Use the Matplotlib toolbar to zoom or pan."
+            )
         )
 
         self.assignments: dict[str, SelectionRecord] = {}
         self.last_cursor: tuple[float, float] | None = None
-        self.zoom_start: tuple[int, int] | None = None
-        self.zoom_box: int | None = None
+        self.active_target_combo: ttk.Combobox | None = None
+        self.active_category_combo: ttk.Combobox | None = None
 
-        self.left_margin = 84
-        self.top_margin = 24
-        self.right_margin = 24
-        self.bottom_margin = 58
-
-        self.canvas = tk.Canvas(self.root, bg="white", highlightthickness=0)
         self.tree: ttk.Treeview
         self._build_ui()
-        self._bind_canvas()
-        self.active_target.trace_add("write", lambda *_args: self._load_active_selection())
-        self.shared_baseline_var.trace_add("write", lambda *_args: self._shared_baseline_changed())
         self._refresh_tree()
+        if self.mode == "per-variable":
+            self._activate_target(self.targets[0], show_active_category=True)
+        else:
+            self._load_active_selection()
         self._redraw()
+        if self.shared_baseline_requested:
+            self._log_info(
+                "shared_baseline=True was requested, but the viewer now always captures per-target through/extinction wavelengths."
+            )
+        self._log_info(
+            "Calibration viewer initialized: mode=%s groups=%s",
+            self.mode,
+            [group.name for group in self.groups],
+        )
 
     def show(self) -> ViewerSelectionResult:
         self.root.mainloop()
         if self.result is not None:
+            self._log_info("Calibration viewer closed with %d selection(s).", len(self.result.selections))
             return self.result
         if self.cancelled:
+            self._log_info("Calibration viewer cancelled by user.")
             raise SelectionCancelledError("Calibration selection was cancelled.")
         raise RuntimeError("Calibration viewer closed without a result.")
 
@@ -989,24 +1000,52 @@ class _Viewer:
         outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill="both", expand=True)
 
-        controls = ttk.Frame(outer, width=330)
-        controls.pack(side="left", fill="y")
-        controls.pack_propagate(False)
+        controls_wrap = ttk.Frame(outer, width=350)
+        controls_wrap.pack(side="left", fill="y")
+        controls_wrap.pack_propagate(False)
+
+        self.controls_canvas = tk.Canvas(controls_wrap, highlightthickness=0, width=330)
+        controls_scrollbar = ttk.Scrollbar(
+            controls_wrap,
+            orient="vertical",
+            command=self.controls_canvas.yview,
+        )
+        self.controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+        self.controls_canvas.pack(side="left", fill="both", expand=True)
+        controls_scrollbar.pack(side="left", fill="y", padx=(8, 0))
+
+        self.controls_inner = ttk.Frame(self.controls_canvas, width=330)
+        self.controls_window = self.controls_canvas.create_window(
+            (0, 0),
+            window=self.controls_inner,
+            anchor="nw",
+            width=330,
+        )
+        self.controls_inner.bind("<Configure>", self._sync_controls_scroll)
+        self.controls_canvas.bind("<Configure>", self._resize_controls_panel)
+        self.controls_canvas.bind("<Enter>", self._bind_controls_mousewheel)
+        self.controls_canvas.bind("<Leave>", self._unbind_controls_mousewheel)
+        controls = self.controls_inner
 
         plot_wrap = ttk.Frame(outer)
         plot_wrap.pack(side="left", fill="both", expand=True, padx=(12, 0))
+        toolbar_wrap = ttk.Frame(plot_wrap)
+        toolbar_wrap.pack(fill="x")
+        plot_surface = ttk.Frame(plot_wrap)
+        plot_surface.pack(fill="both", expand=True)
 
         ttk.Label(
             controls,
             text=(
-                "Input curves are complex amplitudes. The viewer plots 20*log10(|E|) in dB so "
-                "you can pick wavelength positions and extinction-ratio baselines directly."
+                "The viewer plots 20*log10(|E|) in dB. For each curve target, choose a through "
+                "wavelength and an extinction wavelength. Extinction ratio will be computed "
+                "as P(through) - P(extinction)."
             ),
             wraplength=300,
             justify="left",
         ).pack(fill="x", pady=(0, 12))
 
-        group_frame = ttk.LabelFrame(controls, text="Visible Variables", padding=10)
+        group_frame = ttk.LabelFrame(controls, text="Visible Curves", padding=10)
         group_frame.pack(fill="x", pady=(0, 12))
         for group in self.groups:
             row = ttk.Frame(group_frame)
@@ -1043,10 +1082,18 @@ class _Viewer:
         )
         cursor_buttons = ttk.Frame(cursor_frame)
         cursor_buttons.pack(fill="x")
-        ttk.Button(cursor_buttons, text="Use X", command=self._use_cursor_x).pack(
+        ttk.Button(
+            cursor_buttons,
+            text="Use Through",
+            command=lambda: self._use_cursor_for_slot("through"),
+        ).pack(
             side="left", fill="x", expand=True
         )
-        ttk.Button(cursor_buttons, text="Use Y", command=self._use_cursor_y).pack(
+        ttk.Button(
+            cursor_buttons,
+            text="Use Extinction",
+            command=lambda: self._use_cursor_for_slot("extinction"),
+        ).pack(
             side="left", fill="x", expand=True, padx=(8, 0)
         )
         ttk.Button(cursor_buttons, text="Reset Zoom", command=self._reset_zoom).pack(
@@ -1056,22 +1103,47 @@ class _Viewer:
         select_frame = ttk.LabelFrame(controls, text="Selections", padding=10)
         select_frame.pack(fill="both", expand=True)
         if self.mode == "per-variable":
-            ttk.Label(select_frame, text="Active variable").pack(anchor="w")
-            ttk.Combobox(
+            if len(self.target_categories) > 1:
+                ttk.Label(select_frame, text="Active parameter/group").pack(anchor="w")
+                self.active_category_combo = ttk.Combobox(
+                    select_frame,
+                    textvariable=self.active_category,
+                    state="readonly",
+                    values=self.target_categories,
+                )
+                self.active_category_combo.pack(fill="x", pady=(0, 8))
+                self.active_category_combo.bind("<<ComboboxSelected>>", self._category_selected)
+
+            ttk.Label(select_frame, text="Active target").pack(anchor="w")
+            self.active_target_combo = ttk.Combobox(
                 select_frame,
                 textvariable=self.active_target,
                 state="readonly",
-                values=self.targets,
-            ).pack(fill="x", pady=(0, 8))
+                values=self.targets_by_category[self.active_category.get()],
+            )
+            self.active_target_combo.pack(fill="x", pady=(0, 8))
+            self.active_target_combo.bind("<<ComboboxSelected>>", self._target_selected)
 
-        ttk.Label(select_frame, text="Wavelength (nm)").pack(anchor="w")
-        ttk.Entry(select_frame, textvariable=self.wavelength_var).pack(fill="x", pady=(0, 8))
-        if self.shared_baseline:
-            ttk.Label(select_frame, text="Shared baseline (dB)").pack(anchor="w")
-            ttk.Entry(select_frame, textvariable=self.shared_baseline_var).pack(fill="x", pady=(0, 8))
-        else:
-            ttk.Label(select_frame, text="Baseline (dB)").pack(anchor="w")
-            ttk.Entry(select_frame, textvariable=self.baseline_var).pack(fill="x", pady=(0, 8))
+        ttk.Label(select_frame, text="Left click sets").pack(anchor="w")
+        slot_frame = ttk.Frame(select_frame)
+        slot_frame.pack(fill="x", pady=(0, 8))
+        ttk.Radiobutton(
+            slot_frame,
+            text="Through",
+            value="through",
+            variable=self.selection_slot,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            slot_frame,
+            text="Extinction",
+            value="extinction",
+            variable=self.selection_slot,
+        ).pack(side="left", padx=(12, 0))
+
+        ttk.Label(select_frame, text="Through wavelength (nm)").pack(anchor="w")
+        ttk.Entry(select_frame, textvariable=self.through_wavelength_var).pack(fill="x", pady=(0, 8))
+        ttk.Label(select_frame, text="Extinction wavelength (nm)").pack(anchor="w")
+        ttk.Entry(select_frame, textvariable=self.extinction_wavelength_var).pack(fill="x", pady=(0, 8))
 
         apply_buttons = ttk.Frame(select_frame)
         apply_buttons.pack(fill="x", pady=(0, 8))
@@ -1084,18 +1156,19 @@ class _Viewer:
 
         self.tree = ttk.Treeview(
             select_frame,
-            columns=("target", "wavelength", "baseline"),
+            columns=("target", "through", "extinction"),
             show="headings",
             height=max(5, min(10, len(self.targets))),
         )
-        for column, title, width, anchor in (
+        for column, label, width, anchor in (
             ("target", "Target", 120, "w"),
-            ("wavelength", "Wavelength (nm)", 120, "e"),
-            ("baseline", "Baseline (dB)", 120, "e"),
+            ("through", "Through (nm)", 120, "e"),
+            ("extinction", "Extinction (nm)", 120, "e"),
         ):
-            self.tree.heading(column, text=title)
+            self.tree.heading(column, text=label)
             self.tree.column(column, width=width, anchor=anchor)
         self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self._tree_selected)
 
         footer = ttk.Frame(controls)
         footer.pack(fill="x", pady=(12, 0))
@@ -1106,17 +1179,51 @@ class _Viewer:
             side="left", fill="x", expand=True, padx=(8, 0)
         )
 
-        self.canvas.pack(in_=plot_wrap, fill="both", expand=True)
+        self._build_matplotlib_plot(plot_surface, toolbar_wrap)
         ttk.Label(plot_wrap, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
 
-    def _bind_canvas(self) -> None:
-        self.canvas.bind("<Configure>", lambda _e: self._redraw())
-        self.canvas.bind("<Motion>", self._motion)
-        self.canvas.bind("<Leave>", self._leave)
-        self.canvas.bind("<ButtonPress-1>", self._zoom_press)
-        self.canvas.bind("<B1-Motion>", self._zoom_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._zoom_release)
-        self.canvas.bind("<Button-3>", lambda _e: self._reset_zoom())
+    def _sync_controls_scroll(self, _event: tk.Event[tk.Misc]) -> None:
+        if self.controls_canvas is not None:
+            self.controls_canvas.configure(scrollregion=self.controls_canvas.bbox("all"))
+
+    def _resize_controls_panel(self, event: tk.Event[tk.Misc]) -> None:
+        if self.controls_canvas is not None and self.controls_window is not None:
+            self.controls_canvas.itemconfigure(self.controls_window, width=event.width)
+
+    def _bind_controls_mousewheel(self, _event: tk.Event[tk.Misc]) -> None:
+        self.root.bind_all("<MouseWheel>", self._controls_mousewheel, add="+")
+
+    def _unbind_controls_mousewheel(self, _event: tk.Event[tk.Misc]) -> None:
+        self.root.unbind_all("<MouseWheel>")
+
+    def _controls_mousewheel(self, event: tk.Event[tk.Misc]) -> None:
+        if self.controls_canvas is None:
+            return
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return
+        self.controls_canvas.yview_scroll(int(-delta / 120), "units")
+
+    def _build_matplotlib_plot(self, plot_surface: ttk.Frame, toolbar_wrap: ttk.Frame) -> None:
+        Figure, FigureCanvasTkAgg, NavigationToolbar2Tk = _load_matplotlib_tk()
+
+        self.figure = Figure(figsize=(10.0, 7.0), dpi=100)
+        self.axes = self.figure.add_subplot(111)
+        self.figure.subplots_adjust(left=0.10, right=0.98, top=0.97, bottom=0.11)
+        self.axes.callbacks.connect("xlim_changed", self._axes_limits_changed)
+        self.axes.callbacks.connect("ylim_changed", self._axes_limits_changed)
+
+        self.figure_canvas = FigureCanvasTkAgg(self.figure, master=plot_surface)
+        self.figure_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.figure_canvas.mpl_connect("motion_notify_event", self._motion)
+        self.figure_canvas.mpl_connect("button_press_event", self._button_press)
+        self.figure_canvas.mpl_connect("axes_leave_event", self._leave)
+        self.figure_canvas.mpl_connect("figure_leave_event", self._leave)
+
+        self.toolbar = NavigationToolbar2Tk(self.figure_canvas, toolbar_wrap, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(fill="x")
+        self._log_info("Matplotlib calibration viewer plot surface initialized.")
 
     def _show_all(self) -> None:
         for value in self.visible_vars.values():
@@ -1129,299 +1236,545 @@ class _Viewer:
         self._redraw()
 
     def _show_only_active(self) -> None:
+        if self.mode == "per-variable" and len(self.target_categories) > 1:
+            self._show_only_active_category()
+            return
+
         active = self.active_target.get()
         for name, value in self.visible_vars.items():
             value.set(active == GLOBAL_TARGET or name == active)
         self._redraw()
 
-    def _use_cursor_x(self) -> None:
-        if self.last_cursor is not None:
-            self.wavelength_var.set(f"{self.last_cursor[0]:.6f}")
-
-    def _use_cursor_y(self) -> None:
-        if self.last_cursor is None:
-            return
-        if self.shared_baseline:
-            self.shared_baseline_var.set(f"{self.last_cursor[1]:.4f}")
-        else:
-            self.baseline_var.set(f"{self.last_cursor[1]:.4f}")
-
-    def _apply_selection(self) -> None:
-        try:
-            wavelength = float(self.wavelength_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid wavelength", "Please enter a valid wavelength in nm.")
-            return
-
-        try:
-            baseline = (
-                float(self.shared_baseline_var.get())
-                if self.shared_baseline
-                else float(self.baseline_var.get())
-            )
-        except ValueError:
-            messagebox.showerror("Invalid baseline", "Please enter a valid baseline in dB.")
-            return
-
-        self.assignments[self.active_target.get()] = SelectionRecord(wavelength, baseline)
-        self._refresh_tree()
+    def _show_only_active_category(self) -> None:
+        active_category = self.active_category.get()
+        for name, value in self.visible_vars.items():
+            value.set(self.target_category_by_name.get(name) == active_category)
         self._redraw()
 
+    def _update_active_target_values(self) -> None:
+        if self.active_target_combo is None:
+            return
+        current_targets = self.targets_by_category.get(self.active_category.get(), self.targets)
+        self.active_target_combo.configure(values=current_targets)
+
+    def _first_pending_target(self, targets: Sequence[str]) -> str | None:
+        for target in targets:
+            if target not in self.assignments:
+                return target
+        return None
+
+    def _activate_target(self, target: str, *, show_active_category: bool) -> None:
+        category = self.target_category_by_name.get(target, self.active_category.get())
+        if self.active_category.get() != category:
+            self.active_category.set(category)
+        self._update_active_target_values()
+        self.active_target.set(target)
+        if show_active_category:
+            for name, value in self.visible_vars.items():
+                value.set(self.target_category_by_name.get(name) == category)
+        self._load_active_selection()
+        self._redraw()
+
+    def _activate_category(self, category: str) -> None:
+        if category not in self.targets_by_category:
+            return
+        self.active_category.set(category)
+        self._update_active_target_values()
+        target = self._first_pending_target(self.targets_by_category[category])
+        if target is None:
+            target = self.targets_by_category[category][0]
+        self._activate_target(target, show_active_category=True)
+
+    def _advance_to_next_target(self) -> bool:
+        current_target = self.active_target.get()
+        current_index = self.targets.index(current_target)
+        search_order = self.targets[current_index + 1 :] + self.targets[: current_index + 1]
+        for target in search_order:
+            if target not in self.assignments:
+                self._activate_target(target, show_active_category=True)
+                self.status.set(
+                    f"Moved to the next unfinished target: {target}. Select through first."
+                )
+                return True
+        self.status.set("All curve targets have been assigned. Review selections or confirm.")
+        return False
+
+    def _category_selected(self, _event: tk.Event[tk.Misc]) -> None:
+        self._activate_category(self.active_category.get())
+
+    def _target_selected(self, _event: tk.Event[tk.Misc]) -> None:
+        self._activate_target(self.active_target.get(), show_active_category=True)
+
+    def _use_cursor_for_slot(self, slot: str) -> None:
+        if self.last_cursor is None:
+            return
+        self._set_selection_wavelength(slot, self.last_cursor[0], source="cursor button")
+        self._refresh_tree()
+
+    def _set_selection_wavelength(self, slot: str, wavelength_nm: float, *, source: str) -> None:
+        formatted = f"{float(wavelength_nm):.6f}"
+        if slot == "through":
+            self.through_wavelength_var.set(formatted)
+            self.selection_slot.set("extinction")
+            self.status.set(f"Through wavelength set to {formatted} nm from {source}.")
+        else:
+            self.extinction_wavelength_var.set(formatted)
+            self.status.set(f"Extinction wavelength set to {formatted} nm from {source}.")
+        self._log_info(
+            "%s set %s wavelength to %.6f for %s.",
+            source.capitalize(),
+            slot,
+            wavelength_nm,
+            self.active_target.get(),
+        )
+        self._apply_selection_from_fields(
+            show_error=False,
+            reason=source,
+            advance_to_next=(slot == "extinction"),
+        )
+
+    def _parse_selection_fields(self) -> SelectionRecord:
+        through_text = self.through_wavelength_var.get().strip()
+        extinction_text = self.extinction_wavelength_var.get().strip()
+        if not through_text or not extinction_text:
+            raise ValueError("Both through wavelength and extinction wavelength are required.")
+
+        try:
+            through_wavelength = float(through_text)
+        except ValueError as exc:
+            raise ValueError("Through wavelength must be a valid number in nm.") from exc
+        try:
+            extinction_wavelength = float(extinction_text)
+        except ValueError as exc:
+            raise ValueError("Extinction wavelength must be a valid number in nm.") from exc
+
+        return SelectionRecord(
+            through_wavelength_nm=through_wavelength,
+            extinction_wavelength_nm=extinction_wavelength,
+        )
+
+    def _apply_selection(self) -> None:
+        self._apply_selection_from_fields(
+            show_error=True,
+            reason="apply button",
+            advance_to_next=True,
+            finalize_when_complete=True,
+        )
+
+    def _apply_selection_from_fields(
+        self,
+        *,
+        show_error: bool,
+        reason: str,
+        advance_to_next: bool = False,
+        finalize_when_complete: bool = False,
+    ) -> bool:
+        try:
+            record = self._parse_selection_fields()
+        except ValueError as exc:
+            if show_error:
+                messagebox.showerror("Invalid selection", str(exc))
+            return False
+
+        active_target = self.active_target.get()
+        self.assignments[active_target] = record
+        self._log_info(
+            "Selection applied for %s from %s: through=%.6f extinction=%.6f",
+            active_target,
+            reason,
+            record.through_wavelength_nm,
+            record.extinction_wavelength_nm,
+        )
+        self._refresh_tree()
+        if advance_to_next and self._advance_to_next_target():
+            return True
+        if finalize_when_complete and self._all_targets_assigned():
+            return self._finalize_result(show_error=show_error)
+        self._redraw()
+        return True
+
     def _clear_selection(self) -> None:
-        self.assignments.pop(self.active_target.get(), None)
-        self.wavelength_var.set("")
-        if not self.shared_baseline:
-            self.baseline_var.set("")
+        active_target = self.active_target.get()
+        self.assignments.pop(active_target, None)
+        self.through_wavelength_var.set("")
+        self.extinction_wavelength_var.set("")
+        self._log_info("Selection cleared for %s.", active_target)
         self._refresh_tree()
         self._redraw()
 
     def _load_active_selection(self) -> None:
-        record = self.assignments.get(self.active_target.get())
+        active_target = self.active_target.get()
+        if self.tree.exists(active_target):
+            self.tree.selection_set(active_target)
+            self.tree.focus(active_target)
+            self.tree.see(active_target)
+        self.selection_slot.set("through")
+        record = self.assignments.get(active_target)
         if record is None:
-            self.wavelength_var.set("")
-            if not self.shared_baseline:
-                self.baseline_var.set("")
+            self.through_wavelength_var.set("")
+            self.extinction_wavelength_var.set("")
+            self.status.set(
+                "Active target changed. Select the through wavelength first, then the extinction wavelength."
+            )
             return
-        self.wavelength_var.set(f"{record.wavelength_nm:.6f}")
-        if not self.shared_baseline:
-            self.baseline_var.set(f"{record.baseline_db:.4f}")
-
-    def _shared_baseline_changed(self) -> None:
-        if self.shared_baseline:
-            self._refresh_tree()
-            self._redraw()
+        self.through_wavelength_var.set(f"{record.through_wavelength_nm:.6f}")
+        self.extinction_wavelength_var.set(f"{record.extinction_wavelength_nm:.6f}")
+        self.status.set(
+            "Active target changed. Through/extinction values loaded; the next left-click will set through."
+        )
 
     def _refresh_tree(self) -> None:
         self.tree.delete(*self.tree.get_children())
-        shared = self._shared_baseline()
         for target in self.targets:
             record = self.assignments.get(target)
-            wavelength_text = "--" if record is None else f"{record.wavelength_nm:.6f}"
-            baseline_text = "--"
-            if record is not None:
-                baseline_text = f"{(shared if shared is not None else record.baseline_db):.4f}"
-            elif shared is not None:
-                baseline_text = f"{shared:.4f}"
+            through_text = "--" if record is None else f"{record.through_wavelength_nm:.6f}"
+            extinction_text = "--" if record is None else f"{record.extinction_wavelength_nm:.6f}"
             self.tree.insert(
                 "",
                 "end",
-                values=("global" if target == GLOBAL_TARGET else target, wavelength_text, baseline_text),
+                iid=target,
+                values=("global" if target == GLOBAL_TARGET else target, through_text, extinction_text),
             )
+        active_target = self.active_target.get()
+        if self.tree.exists(active_target):
+            self.tree.selection_set(active_target)
+            self.tree.focus(active_target)
 
-    def _motion(self, event: tk.Event[tk.Misc]) -> None:
-        if not self._in_plot(event.x, event.y):
-            self.last_cursor = None
-            self.cursor_x.set("--")
-            self.cursor_y.set("--")
-            self._redraw()
+    def _tree_selected(self, _event: tk.Event[tk.Misc]) -> None:
+        selection = self.tree.selection()
+        if not selection:
             return
-        xdata, ydata = self._to_data(event.x, event.y)
+        target = selection[0]
+        if target in self.targets and target != self.active_target.get():
+            self._activate_target(target, show_active_category=True)
+
+    def _motion(self, event: Any) -> None:
+        if self.axes is None or event.inaxes is not self.axes or event.xdata is None or event.ydata is None:
+            self._leave()
+            return
+        self.last_cursor = (float(event.xdata), float(event.ydata))
+        self.cursor_x.set(f"{self.last_cursor[0]:.6f}")
+        self.cursor_y.set(f"{self.last_cursor[1]:.4f}")
+        self._update_cursor_overlay()
+
+    def _button_press(self, event: Any) -> None:
+        if (
+            self.axes is None
+            or event.inaxes is not self.axes
+            or event.xdata is None
+        ):
+            return
+
+        button = getattr(event, "button", None)
+        if not (button == 1 or str(button).endswith("LEFT")):
+            return
+
+        toolbar_mode = str(getattr(self.toolbar, "mode", "")).strip().lower()
+        if toolbar_mode:
+            self._log_info("Left-click ignored because toolbar mode is active: %s", toolbar_mode)
+            return
+
+        xdata = float(event.xdata)
+        ydata = float(event.ydata) if event.ydata is not None else float("nan")
         self.last_cursor = (xdata, ydata)
         self.cursor_x.set(f"{xdata:.6f}")
-        self.cursor_y.set(f"{ydata:.4f}")
-        self._redraw()
+        self.cursor_y.set("--" if not math.isfinite(ydata) else f"{ydata:.4f}")
+        slot = self.selection_slot.get()
+        self._set_selection_wavelength(slot, xdata, source="left click")
+        self._refresh_tree()
+        self._update_cursor_overlay()
 
-    def _leave(self, _event: tk.Event[tk.Misc]) -> None:
+    def _leave(self, _event: Any | None = None) -> None:
         self.last_cursor = None
         self.cursor_x.set("--")
         self.cursor_y.set("--")
-        self._redraw()
-
-    def _zoom_press(self, event: tk.Event[tk.Misc]) -> None:
-        if self._in_plot(event.x, event.y):
-            self.zoom_start = (event.x, event.y)
-
-    def _zoom_drag(self, event: tk.Event[tk.Misc]) -> None:
-        if self.zoom_start is None:
-            return
-        if self.zoom_box is not None:
-            self.canvas.delete(self.zoom_box)
-        x0, y0 = self.zoom_start
-        self.zoom_box = self.canvas.create_rectangle(x0, y0, event.x, event.y, dash=(4, 2))
-
-    def _zoom_release(self, event: tk.Event[tk.Misc]) -> None:
-        if self.zoom_start is None:
-            return
-        x0, y0 = self.zoom_start
-        self.zoom_start = None
-        if self.zoom_box is not None:
-            self.canvas.delete(self.zoom_box)
-            self.zoom_box = None
-        if abs(event.x - x0) < 10 or abs(event.y - y0) < 10:
-            return
-        if not (self._in_plot(x0, y0) and self._in_plot(event.x, event.y)):
-            return
-        d0 = self._to_data(x0, y0)
-        d1 = self._to_data(event.x, event.y)
-        self.range = _PlotRange(
-            xmin=min(d0[0], d1[0]),
-            xmax=max(d0[0], d1[0]),
-            ymin=min(d0[1], d1[1]),
-            ymax=max(d0[1], d1[1]),
-        )
-        self.status.set("Zoom applied. Move for crosshair. Right click resets zoom.")
-        self._redraw()
+        self._update_cursor_overlay()
 
     def _reset_zoom(self) -> None:
         self.range = self.default_range
-        self.status.set("Move for crosshair. Drag with left mouse to zoom. Right click resets zoom.")
-        self._redraw()
+        self.status.set("View reset to the full visible range.")
+        self._log_info("Viewer zoom reset to default range.")
+        self._apply_range_to_axes()
 
     def _confirm(self) -> None:
-        shared = self._shared_baseline()
+        self._apply_selection_from_fields(show_error=False, reason="confirm")
+        self._finalize_result(show_error=True)
+
+    def _all_targets_assigned(self) -> bool:
+        return all(target in self.assignments for target in self.targets)
+
+    def _finalize_result(self, *, show_error: bool) -> bool:
         selections: dict[str, SelectionRecord] = {}
         for target in self.targets:
             record = self.assignments.get(target)
             if record is None:
-                messagebox.showerror(
-                    "Missing selection",
-                    f"Selection for '{'global' if target == GLOBAL_TARGET else target}' is missing.",
-                )
-                return
-            selections[target] = SelectionRecord(
-                wavelength_nm=record.wavelength_nm,
-                baseline_db=shared if shared is not None else record.baseline_db,
-            )
+                if show_error:
+                    messagebox.showerror(
+                        "Missing selection",
+                        (
+                            f"Selection for '{'global' if target == GLOBAL_TARGET else target}' is missing. "
+                            "Each target needs both a through wavelength and an extinction wavelength."
+                        ),
+                    )
+                return False
+            selections[target] = record
         self.result = ViewerSelectionResult(
             selections=selections,
             visible_groups=tuple(name for name, var in self.visible_vars.items() if var.get()),
             x_limits_nm=(self.range.xmin, self.range.xmax),
             y_limits_db=(self.range.ymin, self.range.ymax),
-            shared_baseline_db=shared,
+        )
+        self._log_info(
+            "Viewer confirmation completed: visible_groups=%s x_limits=%s y_limits=%s",
+            self.result.visible_groups,
+            self.result.x_limits_nm,
+            self.result.y_limits_db,
         )
         self.root.destroy()
+        return True
 
     def cancel(self) -> None:
         self.cancelled = True
         self.root.destroy()
 
-    def _shared_baseline(self) -> float | None:
-        if not self.shared_baseline:
-            return None
-        try:
-            return float(self.shared_baseline_var.get())
-        except ValueError:
-            return None
+    def _log_info(self, message: str, *args: Any) -> None:
+        if self.logger is not None:
+            self.logger.info(message, *args)
 
-    def _plot_box(self) -> tuple[int, int, int, int]:
-        width = max(self.canvas.winfo_width(), 400)
-        height = max(self.canvas.winfo_height(), 300)
-        left = self.left_margin
-        top = self.top_margin
-        right = width - self.right_margin
-        bottom = height - self.bottom_margin
-        return left, top, right, bottom
+    def _log_exception(self, message: str) -> None:
+        if self.logger is not None:
+            self.logger.exception(message)
 
-    def _in_plot(self, x: int, y: int) -> bool:
-        left, top, right, bottom = self._plot_box()
-        return left <= x <= right and top <= y <= bottom
-
-    def _to_canvas(self, xdata: float, ydata: float) -> tuple[float, float]:
-        left, top, right, bottom = self._plot_box()
-        xspan = self.range.xmax - self.range.xmin
-        yspan = self.range.ymax - self.range.ymin
-        xratio = 0.0 if xspan <= 0 else (xdata - self.range.xmin) / xspan
-        yratio = 0.0 if yspan <= 0 else (self.range.ymax - ydata) / yspan
-        return left + xratio * (right - left), top + yratio * (bottom - top)
-
-    def _to_data(self, x: int, y: int) -> tuple[float, float]:
-        left, top, right, bottom = self._plot_box()
-        xratio = (x - left) / max(right - left, 1)
-        yratio = (y - top) / max(bottom - top, 1)
-        return (
-            self.range.xmin + xratio * (self.range.xmax - self.range.xmin),
-            self.range.ymax - yratio * (self.range.ymax - self.range.ymin),
+    def _axes_limits_changed(self, _axes: Any) -> None:
+        if self.axes is None or self._syncing_limits:
+            return
+        xlim = self.axes.get_xlim()
+        ylim = self.axes.get_ylim()
+        self.range = _PlotRange(
+            xmin=float(min(xlim)),
+            xmax=float(max(xlim)),
+            ymin=float(min(ylim)),
+            ymax=float(max(ylim)),
         )
 
+    def _apply_range_to_axes(self, *, draw: bool = True) -> None:
+        if self.axes is None:
+            return
+        self._syncing_limits = True
+        try:
+            self.axes.set_xlim(self.range.xmin, self.range.xmax)
+            self.axes.set_ylim(self.range.ymin, self.range.ymax)
+        finally:
+            self._syncing_limits = False
+        self._update_cursor_overlay(draw=draw)
+
+    def _install_cursor_overlay(self) -> None:
+        if self.axes is None:
+            return
+        self.cursor_vline = self.axes.axvline(
+            0.0,
+            color="#666666",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.8,
+            visible=False,
+        )
+        self.cursor_hline = self.axes.axhline(
+            0.0,
+            color="#666666",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.8,
+            visible=False,
+        )
+        self.cursor_annotation = self.axes.annotate(
+            "",
+            xy=(0.0, 0.0),
+            xytext=(12, 12),
+            textcoords="offset points",
+            fontfamily="Consolas",
+            fontsize=9,
+            bbox={
+                "boxstyle": "round,pad=0.25",
+                "fc": "white",
+                "ec": "#909090",
+                "alpha": 0.94,
+            },
+        )
+        self.cursor_annotation.set_visible(False)
+        self._update_cursor_overlay(draw=False)
+
+    def _update_cursor_overlay(self, *, draw: bool = True) -> None:
+        if (
+            self.axes is None
+            or self.figure_canvas is None
+            or self.cursor_vline is None
+            or self.cursor_hline is None
+            or self.cursor_annotation is None
+        ):
+            return
+
+        if self.last_cursor is None:
+            self.cursor_vline.set_visible(False)
+            self.cursor_hline.set_visible(False)
+            self.cursor_annotation.set_visible(False)
+            if draw:
+                self.figure_canvas.draw_idle()
+            return
+
+        xdata, ydata = self.last_cursor
+        xmin, xmax = self.axes.get_xlim()
+        ymin, ymax = self.axes.get_ylim()
+        if not (xmin <= xdata <= xmax and ymin <= ydata <= ymax):
+            self.cursor_vline.set_visible(False)
+            self.cursor_hline.set_visible(False)
+            self.cursor_annotation.set_visible(False)
+            if draw:
+                self.figure_canvas.draw_idle()
+            return
+
+        xoffset = 12 if xdata <= xmin + 0.7 * (xmax - xmin) else -112
+        yoffset = 12 if ydata <= ymin + 0.7 * (ymax - ymin) else -44
+        self.cursor_vline.set_xdata([xdata, xdata])
+        self.cursor_hline.set_ydata([ydata, ydata])
+        self.cursor_vline.set_visible(True)
+        self.cursor_hline.set_visible(True)
+        self.cursor_annotation.xy = (xdata, ydata)
+        self.cursor_annotation.set_position((xoffset, yoffset))
+        self.cursor_annotation.set_text(f"x={xdata:.6f} nm\ny={ydata:.4f} dB")
+        self.cursor_annotation.set_visible(True)
+        if draw:
+            self.figure_canvas.draw_idle()
+
     def _redraw(self) -> None:
-        self.canvas.delete("all")
-        left, top, right, bottom = self._plot_box()
-        self.canvas.create_rectangle(left, top, right, bottom, outline="#444444")
+        if self.axes is None or self.figure_canvas is None:
+            return
 
-        for tick in _ticks(self.range.xmin, self.range.xmax):
-            x, _ = self._to_canvas(tick, self.range.ymin)
-            self.canvas.create_line(x, bottom, x, bottom + 5, fill="#444444")
-            self.canvas.create_text(x, bottom + 18, text=f"{tick:.4f}", font=("Segoe UI", 9))
-        for tick in _ticks(self.range.ymin, self.range.ymax):
-            _, y = self._to_canvas(self.range.xmin, tick)
-            self.canvas.create_line(left - 5, y, left, y, fill="#444444")
-            self.canvas.create_text(left - 10, y, text=f"{tick:.1f}", anchor="e", font=("Segoe UI", 9))
-        self.canvas.create_text((left + right) / 2, bottom + 40, text="Wavelength (nm)")
-        self.canvas.create_text(24, (top + bottom) / 2, text="20*log10(|E|) (dB)", angle=90)
+        preserved_range = self.range
+        self._syncing_limits = True
+        try:
+            self.axes.clear()
+            self.axes.set_facecolor("white")
+            self.axes.grid(True, color="#d7d7d7", linewidth=0.8, alpha=0.65)
+            self.axes.set_xlabel("Wavelength (nm)")
+            self.axes.set_ylabel("20*log10(|E|) (dB)")
 
-        visible = [group for group in self.groups if self.visible_vars[group.name].get()]
-        if not visible:
-            self.canvas.create_text((left + right) / 2, (top + bottom) / 2, text="No variables visible.")
-        for group in visible:
-            for index, curve in enumerate(group.curves):
-                order = np.argsort(curve.wavelength_nm)
-                x = curve.wavelength_nm[order]
-                y = curve.magnitude_db()[order]
-                mask = (x >= self.range.xmin) & (x <= self.range.xmax)
-                if not np.any(mask):
-                    continue
-                x = x[mask]
-                y = y[mask]
-                if x.size < 2:
-                    continue
-                step = max(1, math.ceil(x.size / max(right - left, 1)))
-                points: list[float] = []
-                for xpoint, ypoint in zip(x[::step], y[::step], strict=True):
-                    points.extend(self._to_canvas(float(xpoint), float(ypoint)))
-                if x[-1] != x[::step][-1]:
-                    points.extend(self._to_canvas(float(x[-1]), float(y[-1])))
-                self.canvas.create_line(
-                    *points,
-                    fill=_shade(self.colors[group.name], index, len(group.curves)),
-                    width=2,
+            visible = [group for group in self.groups if self.visible_vars[group.name].get()]
+            legend_handles: list[Any] = []
+            legend_labels: list[str] = []
+            if not visible:
+                self.axes.text(
+                    0.5,
+                    0.5,
+                    "No curves visible.",
+                    transform=self.axes.transAxes,
+                    ha="center",
+                    va="center",
                 )
+            else:
+                for group in visible:
+                    group_line: Any | None = None
+                    for index, curve in enumerate(group.curves):
+                        order = np.argsort(curve.wavelength_nm)
+                        x = curve.wavelength_nm[order]
+                        y = curve.magnitude_db()[order]
+                        if x.size < 2:
+                            continue
+                        color = _shade(self.colors[group.name], index, len(group.curves))
+                        (line,) = self.axes.plot(x, y, color=color, linewidth=2.0, alpha=0.95)
+                        if group_line is None:
+                            group_line = line
+                    if group_line is not None:
+                        legend_handles.append(group_line)
+                        legend_labels.append(group.name)
 
-        shared = self._shared_baseline()
-        for target, record in self.assignments.items():
-            color = "#111111" if target == GLOBAL_TARGET else self.colors[target]
-            if self.range.xmin <= record.wavelength_nm <= self.range.xmax:
-                xpos, _ = self._to_canvas(record.wavelength_nm, self.range.ymin)
-                self.canvas.create_line(xpos, top, xpos, bottom, fill=color, dash=(3, 3))
+                if legend_handles:
+                    self.axes.legend(
+                        legend_handles,
+                        legend_labels,
+                        loc="upper right",
+                        frameon=True,
+                        framealpha=0.92,
+                    )
+
+            active_target = self.active_target.get()
+            for target, record in self.assignments.items():
+                if target != active_target:
+                    continue
+                color = "#111111" if target == GLOBAL_TARGET else self.colors[target]
                 label = "global" if target == GLOBAL_TARGET else target
-                self.canvas.create_text(
-                    xpos + 6,
-                    top + 12,
-                    text=f"{label} x={record.wavelength_nm:.4f}",
-                    anchor="w",
-                    font=("Segoe UI", 9, "bold"),
-                    fill=color,
+                self.axes.axvline(
+                    record.through_wavelength_nm,
+                    color=color,
+                    linestyle="-",
+                    linewidth=1.1,
+                    alpha=0.9,
                 )
-            baseline = shared if shared is not None else record.baseline_db
-            if self.range.ymin <= baseline <= self.range.ymax:
-                _, ypos = self._to_canvas(self.range.xmin, baseline)
-                self.canvas.create_line(left, ypos, right, ypos, fill=color, dash=(5, 3))
-
-        if self.last_cursor is not None:
-            xdata, ydata = self.last_cursor
-            if self.range.xmin <= xdata <= self.range.xmax and self.range.ymin <= ydata <= self.range.ymax:
-                xpos, ypos = self._to_canvas(xdata, ydata)
-                self.canvas.create_line(xpos, top, xpos, bottom, fill="#777777", dash=(2, 2))
-                self.canvas.create_line(left, ypos, right, ypos, fill="#777777", dash=(2, 2))
-                info_x = min(xpos + 8, right - 120)
-                info_y = max(ypos - 12, top + 28)
-                self.canvas.create_rectangle(info_x, info_y - 30, info_x + 120, info_y + 8, fill="white")
-                self.canvas.create_text(
-                    info_x + 6,
-                    info_y - 10,
-                    anchor="w",
-                    font=("Consolas", 9),
-                    text=f"x={xdata:.6f} nm\ny={ydata:.4f} dB",
+                self.axes.axvline(
+                    record.extinction_wavelength_nm,
+                    color=color,
+                    linestyle="--",
+                    linewidth=1.1,
+                    alpha=0.9,
+                )
+                self.axes.annotate(
+                    f"{label} through={record.through_wavelength_nm:.4f}",
+                    xy=(record.through_wavelength_nm, 1.0),
+                    xycoords=("data", "axes fraction"),
+                    xytext=(6, -8),
+                    textcoords="offset points",
+                    ha="left",
+                    va="top",
+                    fontsize=9,
+                    fontweight="bold",
+                    color=color,
+                    bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": color, "alpha": 0.88},
+                )
+                self.axes.annotate(
+                    f"{label} extinction={record.extinction_wavelength_nm:.4f}",
+                    xy=(record.extinction_wavelength_nm, 1.0),
+                    xycoords=("data", "axes fraction"),
+                    xytext=(6, -26),
+                    textcoords="offset points",
+                    ha="left",
+                    va="top",
+                    fontsize=9,
+                    fontweight="bold",
+                    color=color,
+                    bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": color, "alpha": 0.88},
                 )
 
-        if visible:
-            box_left = max(right - 210, 160)
-            box_top = top + 8
-            self.canvas.create_rectangle(box_left, box_top, right - 8, box_top + 26 + 22 * len(visible))
-            self.canvas.create_text(box_left + 10, box_top + 12, anchor="w", text="Visible variables")
-            for index, group in enumerate(visible, start=1):
-                y = box_top + 10 + 20 * index
-                self.canvas.create_rectangle(box_left + 10, y - 5, box_left + 22, y + 7, fill=self.colors[group.name])
-                self.canvas.create_text(box_left + 30, y + 1, anchor="w", text=group.name)
+            self.axes.set_xlim(preserved_range.xmin, preserved_range.xmax)
+            self.axes.set_ylim(preserved_range.ymin, preserved_range.ymax)
+        finally:
+            self._syncing_limits = False
+
+        self._install_cursor_overlay()
+        self.figure_canvas.draw_idle()
+        self._log_plot_state("after-redraw")
+
+    def _log_plot_state(self, reason: str) -> None:
+        if self.logger is None or self.axes is None or self.figure_canvas is None:
+            return
+
+        self.figure_canvas.draw()
+        lines = self.axes.get_lines()
+        xlim = self.axes.get_xlim()
+        ylim = self.axes.get_ylim()
+        self.logger.info(
+            "Calibration figure state [%s]: canvas=%dx%d axes_lines=%d collections=%d texts=%d visible_groups=%s xlim=(%.6f, %.6f) ylim=(%.6f, %.6f)",
+            reason,
+            self.figure_canvas.get_tk_widget().winfo_width(),
+            self.figure_canvas.get_tk_widget().winfo_height(),
+            len(lines),
+            len(self.axes.collections),
+            len(self.axes.texts),
+            [name for name, var in self.visible_vars.items() if var.get()],
+            float(min(xlim)),
+            float(max(xlim)),
+            float(min(ylim)),
+            float(max(ylim)),
+        )
 
 
 def _run_viewer(
@@ -1430,9 +1783,16 @@ def _run_viewer(
     mode: str,
     shared_baseline: bool,
     title: str,
+    logger: logging.Logger | None = None,
 ) -> ViewerSelectionResult:
     sequence = list(groups.values()) if isinstance(groups, Mapping) else list(groups)
-    return _Viewer(sequence, mode=mode, shared_baseline=shared_baseline, title=title).show()
+    return _MatplotlibViewer(
+        sequence,
+        mode=mode,
+        shared_baseline=shared_baseline,
+        title=title,
+        logger=logger,
+    ).show()
 
 
 def _normalize_groups(groups: Sequence[CurveGroup]) -> list[CurveGroup]:
@@ -1480,14 +1840,6 @@ def _as_float_1d(values: ArrayLike, field_name: str) -> NDArray[np.float64]:
     if array.ndim != 1 or array.size < 2:
         raise ValueError(f"{field_name} must be a 1D array with at least two samples.")
     return array.astype(np.float64, copy=False)
-
-
-def _ticks(lower: float, upper: float, count: int = 5) -> list[float]:
-    if not math.isfinite(lower) or not math.isfinite(upper):
-        return [0.0]
-    if math.isclose(lower, upper):
-        return [lower]
-    return [float(value) for value in np.linspace(lower, upper, count)]
 
 
 def _shade(color: str, index: int, total: int) -> str:
@@ -1545,7 +1897,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.mode == "single":
             result = select_extinction_reference(_demo_groups(), title=args.title)
-            print({"wavelength_nm": result.wavelength_nm, "baseline_db": result.baseline_db})
+            print(
+                {
+                    "through_wavelength_nm": result.through_wavelength_nm,
+                    "extinction_wavelength_nm": result.extinction_wavelength_nm,
+                }
+            )
         else:
             result = select_variable_targets(
                 _demo_groups(),
@@ -1554,10 +1911,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(
                 {
-                    "shared_baseline_db": result.shared_baseline_db,
                     "visible_groups": list(result.visible_groups),
                     "selections": {
-                        key: {"wavelength_nm": value.wavelength_nm, "baseline_db": value.baseline_db}
+                        key: {
+                            "through_wavelength_nm": value.through_wavelength_nm,
+                            "extinction_wavelength_nm": value.extinction_wavelength_nm,
+                        }
                         for key, value in result.selections.items()
                     },
                 }

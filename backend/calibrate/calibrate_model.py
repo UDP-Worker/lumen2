@@ -14,6 +14,7 @@ from backend.calibrate._shared import (
     extinction_ratio_db,
     get_mapping,
     load_raw_yaml,
+    ordered_selection_records,
     resolve_model_name,
     resolve_zero_tunable_config,
     save_zero_tunable_config,
@@ -25,12 +26,13 @@ from backend.interface.matlab_bridge import matlab_engine_session
 from backend.model import load_model_config, simulate_from_dict
 from backend.utils.complex_response_viewer import (
     SelectionCancelledError,
+    SelectionRecord,
     TunableEditorPlot,
     TunableEditorResult,
     TunableParameterSpec,
     build_curve_group,
     edit_tunable_parameters,
-    select_extinction_reference,
+    select_variable_targets,
 )
 
 
@@ -46,6 +48,7 @@ def run_model_calibration(
     model_name = resolve_model_name(raw_config, resolved_config)
     destination_dir = Path(output_dir).resolve() if output_dir is not None else ensure_output_dir(model_name)
     destination_dir.mkdir(parents=True, exist_ok=True)
+    logger = _build_model_calibration_logger(model_name, destination_dir)
 
     _require_explicit_zero_tunable_config(raw_config, resolved_config, config_path=config_path)
     zero_tunable = resolve_zero_tunable_config(raw_config, resolved_config)
@@ -65,6 +68,9 @@ def run_model_calibration(
     results: dict[str, Any] = {}
 
     with matlab_engine_session() as engine:
+        curve_groups: list[Any] = []
+        target_maps_by_parameter: dict[str, dict[str, int]] = {}
+        bundles_by_parameter: dict[str, CurveSweepBundle] = {}
         for parameter_name in parameter_names:
             sweep_values = _resolve_parameter_sweep_values(
                 parameter_name,
@@ -72,28 +78,62 @@ def run_model_calibration(
                 model_sweep_section,
                 num_samples=num_samples,
             )
+            logger.info(
+                "Starting model calibration selection for %s with %d sweep samples.",
+                parameter_name,
+                len(sweep_values),
+            )
             bundle = _simulate_parameter_sweep(
                 parameter_name,
                 sweep_values,
                 base_config,
                 engine=engine,
             )
-            selection = select_extinction_reference(
-                [bundle.to_curve_group()],
-                title=f"Model calibration: {parameter_name}",
-            )
-            power_samples = bundle.power_db_at(selection.wavelength_nm)
-            extinction_samples = extinction_ratio_db(power_samples, selection.baseline_db)
-
             bundles.append(bundle)
-            results[parameter_name] = {
-                "selection": {
-                    "wavelength_nm": float(selection.wavelength_nm),
-                    "baseline_db": float(selection.baseline_db),
+            bundles_by_parameter[parameter_name] = bundle
+            parameter_curve_groups, target_to_index = bundle.to_single_curve_groups()
+            curve_groups.extend(parameter_curve_groups)
+            target_maps_by_parameter[parameter_name] = target_to_index
+
+        viewer_result = select_variable_targets(
+            curve_groups,
+            title="Model calibration",
+            shared_baseline=False,
+            logger=logger,
+        )
+
+        for parameter_name in parameter_names:
+            bundle = bundles_by_parameter[parameter_name]
+            curve_selections = ordered_selection_records(
+                target_maps_by_parameter[parameter_name],
+                {
+                    name: record
+                    for name, record in viewer_result.selections.items()
+                    if name in target_maps_by_parameter[parameter_name]
                 },
+                expected_count=len(bundle.sweep_values),
+            )
+            logger.info(
+                "Completed model calibration selection for %s with %d curve-specific selections.",
+                parameter_name,
+                len(curve_selections),
+            )
+            through_power_samples = bundle.power_db_at_curve_wavelengths(
+                [record.through_wavelength_nm for record in curve_selections]
+            )
+            extinction_power_samples = bundle.power_db_at_curve_wavelengths(
+                [record.extinction_wavelength_nm for record in curve_selections]
+            )
+            extinction_samples = extinction_ratio_db(through_power_samples, extinction_power_samples)
+
+            results[parameter_name] = {
+                "curve_selections": _serialize_curve_selections(bundle, curve_selections),
                 "zero_tunable_value": float(zero_tunable[parameter_name]),
                 "sweep_values": [float(value) for value in bundle.sweep_values],
-                "power_db_at_target": [float(value) for value in power_samples],
+                "power_db_at_through_wavelength": [float(value) for value in through_power_samples],
+                "power_db_at_extinction_wavelength": [
+                    float(value) for value in extinction_power_samples
+                ],
                 "extinction_ratio_db": [float(value) for value in extinction_samples],
                 "curve_summary": summarize_curve_bundle(bundle),
             }
@@ -110,6 +150,22 @@ def run_model_calibration(
     json_path = write_json(destination_dir / "model_calibration.json", payload)
     payload["json_path"] = str(json_path)
     return payload
+
+
+def _serialize_curve_selections(
+    bundle: CurveSweepBundle,
+    curve_selections: Sequence[SelectionRecord],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "curve_index": int(index),
+            "curve_label": f"{bundle.name}={float(bundle.sweep_values[index]):+.6g}",
+            "sweep_value": float(bundle.sweep_values[index]),
+            "through_wavelength_nm": float(record.through_wavelength_nm),
+            "extinction_wavelength_nm": float(record.extinction_wavelength_nm),
+        }
+        for index, record in enumerate(curve_selections)
+    ]
 
 
 def edit_model_zero_config(
@@ -315,6 +371,26 @@ def _build_zero_config_logger(model_name: str, destination_dir: Path) -> logging
     logger.propagate = False
 
     log_path = destination_dir / "zero_config_editor.log"
+    resolved_log_path = log_path.resolve()
+    for handler in list(logger.handlers):
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == resolved_log_path:
+            return logger
+        logger.removeHandler(handler)
+        handler.close()
+
+    handler = logging.FileHandler(resolved_log_path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+def _build_model_calibration_logger(model_name: str, destination_dir: Path) -> logging.Logger:
+    logger = logging.getLogger(f"backend.calibrate.model_selection.{model_name}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    log_path = destination_dir / "model_calibration_viewer.log"
     resolved_log_path = log_path.resolve()
     for handler in list(logger.handlers):
         if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == resolved_log_path:

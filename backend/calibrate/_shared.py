@@ -10,7 +10,7 @@ import numpy as np
 import yaml
 from numpy.typing import NDArray
 
-from backend.utils.complex_response_viewer import CurveGroup, build_curve_group
+from backend.utils.complex_response_viewer import CurveGroup, SelectionRecord, build_curve_group
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CALIBRATION_DATA_ROOT = REPO_ROOT / "backend" / "calibrate" / "data"
@@ -45,6 +45,49 @@ class CurveSweepBundle:
             ],
             dtype=float,
         )
+
+    def power_db_at_curve_wavelengths(
+        self,
+        wavelength_nm: Sequence[float] | NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        wavelength_array = np.asarray(wavelength_nm, dtype=float)
+        if wavelength_array.ndim != 1 or wavelength_array.size != self.power_db_matrix.shape[0]:
+            raise ValueError(
+                "wavelength_nm must be a 1D array with one wavelength per sweep curve."
+            )
+        return np.asarray(
+            [
+                np.interp(
+                    float(wavelength_array[index]),
+                    self.wavelength_nm,
+                    self.power_db_matrix[index],
+                )
+                for index in range(self.power_db_matrix.shape[0])
+            ],
+            dtype=float,
+        )
+
+    def to_single_curve_groups(self) -> tuple[list[CurveGroup], dict[str, int]]:
+        groups: list[CurveGroup] = []
+        target_to_index: dict[str, int] = {}
+        for index, sweep_value in enumerate(self.sweep_values):
+            sweep_text = f"{float(sweep_value):+.6g}"
+            target_name = f"{self.name}[{index}] {sweep_text}"
+            group = build_curve_group(
+                target_name,
+                self.wavelength_nm,
+                self.complex_response_matrix[index],
+                curve_labels=[f"{self.name}={sweep_text}"],
+                metadata={
+                    **self.metadata,
+                    "source_bundle": self.name,
+                    "curve_index": int(index),
+                    "sweep_value": float(sweep_value),
+                },
+            )
+            groups.append(group)
+            target_to_index[target_name] = int(index)
+        return groups, target_to_index
 
 
 def load_raw_yaml(config_path: str | Path) -> dict[str, Any]:
@@ -131,8 +174,11 @@ def power_db_to_complex_amplitude(power_db: Sequence[float] | NDArray[np.float64
     return amplitude.astype(np.complex128)
 
 
-def extinction_ratio_db(power_db: Sequence[float] | NDArray[np.float64], baseline_db: float) -> NDArray[np.float64]:
-    return float(baseline_db) - np.asarray(power_db, dtype=float)
+def extinction_ratio_db(
+    through_power_db: Sequence[float] | NDArray[np.float64],
+    extinction_power_db: Sequence[float] | NDArray[np.float64],
+) -> NDArray[np.float64]:
+    return np.asarray(through_power_db, dtype=float) - np.asarray(extinction_power_db, dtype=float)
 
 
 def estimate_zero_crossing(
@@ -259,3 +305,22 @@ def summarize_curve_bundle(bundle: CurveSweepBundle) -> dict[str, Any]:
         ],
         "sample_count": int(bundle.wavelength_nm.size),
     }
+
+
+def ordered_selection_records(
+    target_to_index: Mapping[str, int],
+    selections: Mapping[str, SelectionRecord],
+    *,
+    expected_count: int,
+) -> list[SelectionRecord]:
+    ordered: list[SelectionRecord | None] = [None] * expected_count
+    for target_name, record in selections.items():
+        if target_name not in target_to_index:
+            raise ValueError(f"Unexpected selection target '{target_name}'.")
+        ordered[target_to_index[target_name]] = record
+
+    missing = [index for index, record in enumerate(ordered) if record is None]
+    if missing:
+        raise ValueError(f"Selection records are missing for curve indices {missing}.")
+
+    return [record for record in ordered if record is not None]

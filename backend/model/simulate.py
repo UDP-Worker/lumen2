@@ -143,6 +143,7 @@ def _resolve_model_config(raw_config: Mapping[str, Any], config_path: Path) -> d
     resolved["parameters"]["constraints"] = _resolve_parameter_constraints(
         parameters_section.get("constraints"),
         tunable_names=set(resolved["parameters"]["tunable"]),
+        fixed_names=set(resolved["parameters"]["fixed"]),
     )
 
     wavelength_config = resolved["simulation"]["wavelength_nm"]
@@ -264,6 +265,7 @@ def _resolve_parameter_constraints(
     raw_constraints: Any,
     *,
     tunable_names: set[str],
+    fixed_names: set[str],
 ) -> list[dict[str, Any]]:
     if raw_constraints is None:
         return []
@@ -296,16 +298,18 @@ def _resolve_parameter_constraints(
         lhs, lhs_variables = _normalize_constraint_expression(
             constraint_mapping.get("lhs"),
             f"{field_name}.lhs",
-            tunable_names=tunable_names,
+            allowed_names=tunable_names | fixed_names,
         )
         rhs, rhs_variables = _normalize_constraint_expression(
             constraint_mapping.get("rhs"),
             f"{field_name}.rhs",
-            tunable_names=tunable_names,
+            allowed_names=tunable_names | fixed_names,
         )
         variables = sorted(set(lhs_variables) | set(rhs_variables))
         if not variables:
-            raise ValueError(f"{field_name} must reference at least one parameters.tunable entry.")
+            raise ValueError(
+                f"{field_name} must reference at least one parameters.tunable or parameters.fixed entry."
+            )
 
         resolved.append(
             {
@@ -387,8 +391,10 @@ def _attach_parameter_metadata(result: dict[str, Any], resolved_config: Mapping[
     normalized_parameters.setdefault("fixed", resolved_config["parameters"]["fixed"])
     normalized_parameters["tunable_specs"] = resolved_config["parameters"]["tunable"]
     normalized_parameters["constraints"] = resolved_config["parameters"]["constraints"]
+    constraint_values = dict(normalized_tunable_values)
+    constraint_values.update(_extract_fixed_constraint_values(resolved_config["parameters"]["fixed"]))
     normalized_parameters["constraint_status"] = evaluate_parameter_constraints(
-        normalized_tunable_values,
+        constraint_values,
         resolved_config["parameters"]["constraints"],
     )
 
@@ -400,6 +406,16 @@ def _extract_tunable_values(tunable_specs: Mapping[str, Any]) -> dict[str, float
         str(name): _require_real_numeric_scalar(spec["value"], f"parameters.tunable.{name}.value")
         for name, spec in tunable_specs.items()
     }
+
+
+def _extract_fixed_constraint_values(fixed_values: Mapping[str, Any]) -> dict[str, float]:
+    resolved: dict[str, float] = {}
+    for name, value in fixed_values.items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, Real):
+            resolved[str(name)] = float(value)
+    return resolved
 
 
 def _resolve_existing_path(raw_path: Any, *, config_dir: Path) -> Path:
@@ -463,7 +479,7 @@ def _normalize_constraint_expression(
     value: Any,
     field_name: str,
     *,
-    tunable_names: set[str],
+    allowed_names: set[str],
 ) -> tuple[str, list[str]]:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be numeric or a valid expression string.")
@@ -476,7 +492,7 @@ def _normalize_constraint_expression(
     parsed_expression, variables = _parse_constraint_expression(
         expression_text,
         field_name=field_name,
-        tunable_names=tunable_names,
+        allowed_names=allowed_names,
     )
     return ast.unparse(parsed_expression), variables
 
@@ -485,7 +501,7 @@ def _parse_constraint_expression(
     expression_text: str,
     *,
     field_name: str,
-    tunable_names: set[str],
+    allowed_names: set[str],
 ) -> tuple[ast.AST, list[str]]:
     try:
         parsed = ast.parse(expression_text, mode="eval")
@@ -493,7 +509,12 @@ def _parse_constraint_expression(
         raise ValueError(f"{field_name} contains invalid expression syntax: {expression_text}") from exc
 
     referenced_names: set[str] = set()
-    _validate_constraint_node(parsed, field_name=field_name, tunable_names=tunable_names, referenced_names=referenced_names)
+    _validate_constraint_node(
+        parsed,
+        field_name=field_name,
+        allowed_names=allowed_names,
+        referenced_names=referenced_names,
+    )
     return parsed, sorted(referenced_names)
 
 
@@ -501,14 +522,14 @@ def _validate_constraint_node(
     node: ast.AST,
     *,
     field_name: str,
-    tunable_names: set[str],
+    allowed_names: set[str],
     referenced_names: set[str],
 ) -> None:
     if isinstance(node, ast.Expression):
         _validate_constraint_node(
             node.body,
             field_name=field_name,
-            tunable_names=tunable_names,
+            allowed_names=allowed_names,
             referenced_names=referenced_names,
         )
         return
@@ -517,13 +538,13 @@ def _validate_constraint_node(
         _validate_constraint_node(
             node.left,
             field_name=field_name,
-            tunable_names=tunable_names,
+            allowed_names=allowed_names,
             referenced_names=referenced_names,
         )
         _validate_constraint_node(
             node.right,
             field_name=field_name,
-            tunable_names=tunable_names,
+            allowed_names=allowed_names,
             referenced_names=referenced_names,
         )
         return
@@ -532,16 +553,16 @@ def _validate_constraint_node(
         _validate_constraint_node(
             node.operand,
             field_name=field_name,
-            tunable_names=tunable_names,
+            allowed_names=allowed_names,
             referenced_names=referenced_names,
         )
         return
 
     if isinstance(node, ast.Name):
-        if node.id not in tunable_names:
+        if node.id not in allowed_names:
             raise ValueError(
-                f"{field_name} references unknown tunable parameter {node.id!r}. "
-                "Constraint expressions may only reference parameters.tunable entries."
+                f"{field_name} references unknown parameter {node.id!r}. "
+                "Constraint expressions may only reference parameters.tunable and parameters.fixed entries."
             )
         referenced_names.add(node.id)
         return
@@ -564,7 +585,7 @@ def _evaluate_constraint_expression(
     parsed, _ = _parse_constraint_expression(
         expression_text,
         field_name=field_name,
-        tunable_names=set(variable_values),
+        allowed_names=set(variable_values),
     )
     return _evaluate_constraint_node(parsed.body, variable_values)
 
