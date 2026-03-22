@@ -16,18 +16,6 @@ outputs:
 
 parameters:
   tunable:
-    thetai:
-      value: 1.5707963267948966
-      bounds: [0.0, 6.283185307179586]
-    thetao:
-      value: 1.5707963267948966
-      bounds: [0.0, 6.283185307179586]
-    fait:
-      value: 1.5550883635269477
-      bounds: [-3.141592653589793, 3.141592653589793]
-    faib:
-      value: -1.5550883635269477
-      bounds: [-3.141592653589793, 3.141592653589793]
     fai1:
       value: -0.1470265361880023
       bounds: [-3.141592653589793, 3.141592653589793]
@@ -40,20 +28,24 @@ parameters:
     fai4:
       value: -1.9471591266949537
       bounds: [-3.141592653589793, 3.141592653589793]
-
+    theta1: 
+      value: -1.9540706305328512
+      bounds: [-3.141592653589793, 3.141592653589793]
+    theta2: 
+      value: -2.2933626371205489
+      bounds: [-3.141592653589793, 3.141592653589793]
+    theta3: 
+      value: -1.9540706305328512
+      bounds: [-3.141592653589793, 3.141592653589793]
+    theta4: 
+      value: -2.2933626371205489
+      bounds: [-3.141592653589793, 3.141592653589793]
+      
   constraints:
-    - name: shared_outer_phase
-      lhs: thetai
-      operator: "=="
-      rhs: thetao
     - name: balanced_ring_bias
       lhs: "fait + faib"
       operator: "=="
       rhs: 0.0
-    - name: ring_phase_order
-      lhs: fai2
-      operator: "<="
-      rhs: fai1
 
   fixed:
     E1:
@@ -64,10 +56,11 @@ parameters:
       imag: 0.0
     Ki: 0.5
     Ko: 0.5
-    theta1: -1.9540706305328512
-    theta2: -2.2933626371205489
-    theta3: -1.9540706305328512
-    theta4: -2.2933626371205489
+    thetai: 1.5707963267948966
+    thetao: 1.5707963267948966
+    faib: -1.5550883635269477
+    fait: 1.5550883635269477
+
     Alfadb: 15.0
     ng: 4.3
     L1: 0.00035
