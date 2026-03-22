@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import logging
 import math
+import re
 import tkinter as tk
 from dataclasses import dataclass, field
+from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -23,6 +26,7 @@ PALETTE = (
     "#66a182",
     "#6f4e7c",
 )
+_MATPLOTLIB_TK_IMPORTS: tuple[Any, Any, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +61,26 @@ class ViewerSelectionResult:
     x_limits_nm: tuple[float, float]
     y_limits_db: tuple[float, float]
     shared_baseline_db: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TunableParameterSpec:
+    name: str
+    value: float
+    lower_bound: float | None = None
+    upper_bound: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TunableEditorPlot:
+    groups: tuple[CurveGroup, ...]
+    summary_lines: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TunableEditorResult:
+    values: dict[str, float]
+    saved_path: str | None = None
 
 
 class SelectionCancelledError(RuntimeError):
@@ -145,6 +169,750 @@ def select_variable_targets(
     shared_baseline: bool = True,
 ) -> ViewerSelectionResult:
     return _run_viewer(groups, mode="per-variable", shared_baseline=shared_baseline, title=title)
+
+
+def edit_tunable_parameters(
+    parameter_specs: Sequence[TunableParameterSpec],
+    *,
+    render_curves: Callable[[dict[str, float]], TunableEditorPlot],
+    save_values: Callable[[dict[str, float]], str | None],
+    title: str = "Edit Tunable Parameters",
+    save_button_text: str = "Save",
+    logger: logging.Logger | None = None,
+) -> TunableEditorResult:
+    return _TunableEditor(
+        parameter_specs,
+        render_curves=render_curves,
+        save_values=save_values,
+        title=title,
+        save_button_text=save_button_text,
+        logger=logger,
+    ).show()
+
+
+def _load_tunable_editor_matplotlib() -> tuple[Any, Any, Any]:
+    global _MATPLOTLIB_TK_IMPORTS
+    if _MATPLOTLIB_TK_IMPORTS is not None:
+        return _MATPLOTLIB_TK_IMPORTS
+
+    try:
+        import matplotlib
+
+        matplotlib.use("TkAgg")
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.figure import Figure
+    except Exception as exc:  # pragma: no cover - import/environment dependent
+        raise RuntimeError(
+            "The zero-config editor requires matplotlib with the TkAgg backend. "
+            "Install 'matplotlib' in the active Python environment."
+        ) from exc
+
+    _MATPLOTLIB_TK_IMPORTS = (Figure, FigureCanvasTkAgg, NavigationToolbar2Tk)
+    return _MATPLOTLIB_TK_IMPORTS
+
+
+class _TunableEditor:
+    def __init__(
+        self,
+        parameter_specs: Sequence[TunableParameterSpec],
+        *,
+        render_curves: Callable[[dict[str, float]], TunableEditorPlot],
+        save_values: Callable[[dict[str, float]], str | None],
+        title: str,
+        save_button_text: str,
+        logger: logging.Logger | None,
+    ) -> None:
+        if not parameter_specs:
+            raise ValueError("At least one tunable parameter is required.")
+
+        self.parameter_specs = tuple(parameter_specs)
+        self.specs_by_name = {spec.name: spec for spec in self.parameter_specs}
+        if len(self.specs_by_name) != len(self.parameter_specs):
+            raise ValueError("Duplicate tunable parameter names are not allowed.")
+
+        self.render_curves = render_curves
+        self.save_values = save_values
+        self.save_button_text = save_button_text
+        self.logger = logger
+
+        self.initial_values = {spec.name: float(spec.value) for spec in self.parameter_specs}
+        self.current_values = dict(self.initial_values)
+        self.saved_path: str | None = None
+        self.groups: list[CurveGroup] = []
+        self.colors: dict[str, str] = {}
+        self.default_range = _PlotRange(0.0, 1.0, -1.0, 1.0)
+        self.range = self.default_range
+        self.last_cursor: tuple[float, float] | None = None
+        self.result: TunableEditorResult | None = None
+        self.cancelled = False
+        self._pending_render_log_id: str | None = None
+        self._syncing_limits = False
+        self.figure: Any | None = None
+        self.axes: Any | None = None
+        self.figure_canvas: Any | None = None
+        self.toolbar: Any | None = None
+        self.cursor_vline: Any | None = None
+        self.cursor_hline: Any | None = None
+        self.cursor_annotation: Any | None = None
+
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:
+            raise RuntimeError("Unable to open tkinter tunable-parameter editor.") from exc
+
+        self.root.title(title)
+        self.root.geometry("1520x900")
+        self.root.minsize(1200, 760)
+        self.root.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        self.status = tk.StringVar(
+            value=(
+                "Adjust tunable values, click Simulate to refresh the curve, then save the zero config."
+            )
+        )
+        self.summary = tk.StringVar(value="")
+        self.summary_lines: tuple[str, ...] = ()
+        self.cursor_x = tk.StringVar(value="--")
+        self.cursor_y = tk.StringVar(value="--")
+        self.value_vars = {
+            spec.name: tk.StringVar(value=self._format_value(spec.value))
+            for spec in self.parameter_specs
+        }
+        self.scales: dict[str, ttk.Scale] = {}
+
+        self.parameter_canvas: tk.Canvas
+        self.parameter_frame: ttk.Frame
+        self.parameter_window: int
+        self._build_ui()
+        self._log_info(
+            "Tunable editor initialized with parameters: %s",
+            ", ".join(spec.name for spec in self.parameter_specs),
+        )
+        self._render_plot(initial=True)
+
+    def show(self) -> TunableEditorResult:
+        self.root.mainloop()
+        if self.result is not None:
+            self._log_info("Tunable editor closed with saved_path=%s", self.result.saved_path)
+            return self.result
+        if self.cancelled:
+            self._log_info("Tunable editor cancelled by user.")
+            raise SelectionCancelledError("Tunable-parameter editing was cancelled.")
+        raise RuntimeError("Tunable-parameter editor closed without a result.")
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self.root, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        controls = ttk.Frame(outer, width=420)
+        controls.pack(side="left", fill="y")
+        controls.pack_propagate(False)
+
+        plot_wrap = ttk.Frame(outer)
+        plot_wrap.pack(side="left", fill="both", expand=True, padx=(12, 0))
+        toolbar_wrap = ttk.Frame(plot_wrap)
+        toolbar_wrap.pack(fill="x")
+        plot_surface = ttk.Frame(plot_wrap)
+        plot_surface.pack(fill="both", expand=True)
+
+        ttk.Label(
+            controls,
+            text=(
+                "This editor runs the current model with the tunable values shown below. "
+                "Use it to find an all-pass / zero-response operating point, then write it "
+                "back to calibration.zero_config.tunable in the YAML file. The right-hand "
+                "plot uses an embedded Matplotlib canvas with the standard navigation toolbar."
+            ),
+            wraplength=390,
+            justify="left",
+        ).pack(fill="x", pady=(0, 12))
+
+        button_row = ttk.Frame(controls)
+        button_row.pack(fill="x", pady=(0, 12))
+        ttk.Button(button_row, text="Simulate", command=self._render_plot).pack(
+            side="left",
+            fill="x",
+            expand=True,
+        )
+        ttk.Button(button_row, text="Reset", command=self._reset_values).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(8, 0),
+        )
+
+        cursor_frame = ttk.LabelFrame(controls, text="Cursor", padding=10)
+        cursor_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(cursor_frame, text="Cursor wavelength (nm)").pack(anchor="w")
+        ttk.Label(cursor_frame, textvariable=self.cursor_x, font=("Consolas", 10, "bold")).pack(
+            anchor="w",
+            pady=(0, 8),
+        )
+        ttk.Label(cursor_frame, text="Cursor magnitude (dB)").pack(anchor="w")
+        ttk.Label(cursor_frame, textvariable=self.cursor_y, font=("Consolas", 10, "bold")).pack(
+            anchor="w",
+            pady=(0, 8),
+        )
+        ttk.Button(cursor_frame, text="Reset Zoom", command=self._reset_zoom).pack(fill="x")
+
+        summary_frame = ttk.LabelFrame(controls, text="Simulation Summary", padding=10)
+        summary_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(
+            summary_frame,
+            textvariable=self.summary,
+            justify="left",
+            wraplength=380,
+        ).pack(fill="x")
+
+        parameter_section = ttk.LabelFrame(controls, text="Tunable Values", padding=8)
+        parameter_section.pack(fill="both", expand=True)
+
+        self.parameter_canvas = tk.Canvas(parameter_section, highlightthickness=0, height=360)
+        scrollbar = ttk.Scrollbar(
+            parameter_section,
+            orient="vertical",
+            command=self.parameter_canvas.yview,
+        )
+        self.parameter_canvas.configure(yscrollcommand=scrollbar.set)
+        self.parameter_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="left", fill="y", padx=(8, 0))
+
+        self.parameter_frame = ttk.Frame(self.parameter_canvas)
+        self.parameter_window = self.parameter_canvas.create_window(
+            (0, 0),
+            window=self.parameter_frame,
+            anchor="nw",
+        )
+        self.parameter_frame.bind("<Configure>", self._sync_parameter_scroll)
+        self.parameter_canvas.bind("<Configure>", self._resize_parameter_frame)
+
+        for spec in self.parameter_specs:
+            row = ttk.LabelFrame(self.parameter_frame, text=spec.name, padding=8)
+            row.pack(fill="x", pady=(0, 8))
+
+            entry = ttk.Entry(row, textvariable=self.value_vars[spec.name])
+            entry.pack(fill="x")
+            entry.bind(
+                "<Return>",
+                lambda _event, name=spec.name: self._apply_entry_value(name, rerender=True),
+            )
+            entry.bind(
+                "<FocusOut>",
+                lambda _event, name=spec.name: self._apply_entry_value(name, rerender=False),
+            )
+
+            lower = spec.lower_bound
+            upper = spec.upper_bound
+            if (
+                lower is not None
+                and upper is not None
+                and math.isfinite(lower)
+                and math.isfinite(upper)
+                and lower < upper
+            ):
+                scale = ttk.Scale(
+                    row,
+                    from_=float(lower),
+                    to=float(upper),
+                    command=lambda raw, name=spec.name: self._scale_changed(name, raw),
+                )
+                scale.set(float(spec.value))
+                scale.pack(fill="x", pady=(6, 0))
+                scale.bind(
+                    "<ButtonRelease-1>",
+                    lambda _event, name=spec.name: self._render_plot_for(name),
+                )
+                self.scales[spec.name] = scale
+
+            bounds_text = "Bounds: unbounded"
+            if lower is not None and upper is not None:
+                bounds_text = f"Bounds: [{self._format_value(lower)}, {self._format_value(upper)}]"
+            ttk.Label(row, text=bounds_text, justify="left").pack(anchor="w", pady=(6, 0))
+
+        footer = ttk.Frame(controls)
+        footer.pack(fill="x", pady=(12, 0))
+        ttk.Button(
+            footer,
+            text=self.save_button_text,
+            command=self._save_current_values,
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(footer, text="Close", command=self._confirm).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(8, 0),
+        )
+
+        self._build_matplotlib_plot(plot_surface, toolbar_wrap)
+        ttk.Label(plot_wrap, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
+
+    def _sync_parameter_scroll(self, _event: tk.Event[tk.Misc]) -> None:
+        self.parameter_canvas.configure(scrollregion=self.parameter_canvas.bbox("all"))
+
+    def _resize_parameter_frame(self, event: tk.Event[tk.Misc]) -> None:
+        self.parameter_canvas.itemconfigure(self.parameter_window, width=event.width)
+
+    def _build_matplotlib_plot(self, plot_surface: ttk.Frame, toolbar_wrap: ttk.Frame) -> None:
+        Figure, FigureCanvasTkAgg, NavigationToolbar2Tk = _load_tunable_editor_matplotlib()
+
+        self.figure = Figure(figsize=(10.0, 7.5), dpi=100)
+        self.axes = self.figure.add_subplot(111)
+        self.figure.subplots_adjust(left=0.10, right=0.98, top=0.97, bottom=0.11)
+        self.axes.callbacks.connect("xlim_changed", self._axes_limits_changed)
+        self.axes.callbacks.connect("ylim_changed", self._axes_limits_changed)
+
+        self.figure_canvas = FigureCanvasTkAgg(self.figure, master=plot_surface)
+        self.figure_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.figure_canvas.mpl_connect("motion_notify_event", self._motion)
+        self.figure_canvas.mpl_connect("axes_leave_event", self._leave)
+        self.figure_canvas.mpl_connect("figure_leave_event", self._leave)
+
+        self.toolbar = NavigationToolbar2Tk(self.figure_canvas, toolbar_wrap, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(fill="x")
+        self._log_info("Matplotlib plot surface initialized for tunable editor.")
+
+    def _render_plot_for(self, name: str) -> None:
+        self._apply_entry_value(name, rerender=True, show_error=False)
+
+    def _scale_changed(self, name: str, raw_value: str) -> None:
+        value = float(raw_value)
+        self.current_values[name] = value
+        self.value_vars[name].set(self._format_value(value))
+
+    def _apply_entry_value(
+        self,
+        name: str,
+        *,
+        rerender: bool,
+        show_error: bool = True,
+    ) -> None:
+        try:
+            value = self._parse_value(name, self.value_vars[name].get())
+        except ValueError as exc:
+            self.value_vars[name].set(self._format_value(self.current_values[name]))
+            if show_error:
+                messagebox.showerror("Invalid value", str(exc))
+            return
+
+        self.current_values[name] = value
+        scale = self.scales.get(name)
+        if scale is not None:
+            scale.set(value)
+        self.value_vars[name].set(self._format_value(value))
+        if rerender:
+            self._render_plot()
+
+    def _collect_values(self) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for name in self.specs_by_name:
+            values[name] = self._parse_value(name, self.value_vars[name].get())
+        return values
+
+    def _parse_value(self, name: str, raw_text: str) -> float:
+        try:
+            value = float(raw_text)
+        except ValueError as exc:
+            raise ValueError(f"'{name}' must be a valid floating-point number.") from exc
+
+        spec = self.specs_by_name[name]
+        if spec.lower_bound is not None and value < spec.lower_bound:
+            raise ValueError(
+                f"'{name}' must be greater than or equal to {self._format_value(spec.lower_bound)}."
+            )
+        if spec.upper_bound is not None and value > spec.upper_bound:
+            raise ValueError(
+                f"'{name}' must be less than or equal to {self._format_value(spec.upper_bound)}."
+            )
+        return float(value)
+
+    def _reset_values(self) -> None:
+        self.current_values = dict(self.initial_values)
+        for name, value in self.current_values.items():
+            self.value_vars[name].set(self._format_value(value))
+            scale = self.scales.get(name)
+            if scale is not None:
+                scale.set(value)
+        self._render_plot()
+
+    def _save_current_values(self) -> None:
+        try:
+            values = self._collect_values()
+        except ValueError as exc:
+            messagebox.showerror("Invalid value", str(exc))
+            return
+
+        try:
+            saved_path = self.save_values(values)
+        except Exception as exc:  # pragma: no cover - GUI error path
+            messagebox.showerror("Save failed", str(exc))
+            self.status.set(f"Save failed: {exc}")
+            self._log_exception("Zero-config save failed")
+            return
+
+        self.current_values = dict(values)
+        self.saved_path = saved_path
+        self._refresh_summary(self.summary_lines)
+        self._log_info("Zero config saved to %s with values=%s", saved_path, values)
+        self.status.set(
+            f"Zero config saved to {saved_path or 'the configured destination'}. "
+            "You can continue tuning or close the editor."
+        )
+        messagebox.showinfo(
+            "Zero config saved",
+            f"Saved calibration.zero_config.tunable to:\n{saved_path}",
+        )
+
+    def _render_plot(self, initial: bool = False) -> None:
+        try:
+            values = self._collect_values()
+        except ValueError as exc:
+            if initial:
+                raise
+            messagebox.showerror("Invalid value", str(exc))
+            return
+
+        self.status.set("Running model simulation...")
+        self.root.update_idletasks()
+        self._log_info("Running tunable-editor simulation with values=%s", values)
+
+        try:
+            plot = self.render_curves(values)
+        except Exception as exc:  # pragma: no cover - GUI error path
+            self.status.set(f"Simulation failed: {exc}")
+            if not initial:
+                messagebox.showerror("Simulation failed", str(exc))
+            self._log_exception("Tunable-editor simulation failed")
+            return
+
+        groups = _normalize_groups(list(plot.groups))
+        self.current_values = dict(values)
+        self.groups = groups
+        self.colors = {
+            group.name: group.color or PALETTE[index % len(PALETTE)]
+            for index, group in enumerate(self.groups)
+        }
+        self.default_range = _default_range(self.groups)
+        self.range = self.default_range
+        self._refresh_summary(plot.summary_lines)
+        self._log_info(
+            "Simulation produced %d group(s), %d curve(s), range=(%.6f, %.6f, %.6f, %.6f)",
+            len(self.groups),
+            sum(len(group.curves) for group in self.groups),
+            self.default_range.xmin,
+            self.default_range.xmax,
+            self.default_range.ymin,
+            self.default_range.ymax,
+        )
+        self.status.set(
+            "Simulation updated. Use the Matplotlib toolbar or Reset Zoom to inspect the curve, then save the zero config."
+        )
+        self._redraw()
+        self.root.update_idletasks()
+        self._schedule_canvas_state_log("after-render")
+
+    def _refresh_summary(self, lines: Sequence[str]) -> None:
+        self.summary_lines = tuple(line for line in lines if line.strip())
+        display_lines = list(self.summary_lines)
+        if self.saved_path:
+            display_lines.append(f"Last saved: {self.saved_path}")
+        self.summary.set("\n".join(display_lines) if display_lines else "No additional summary.")
+
+    def _motion(self, event: Any) -> None:
+        if self.axes is None or event.inaxes is not self.axes or event.xdata is None or event.ydata is None:
+            self._leave()
+            return
+        self.last_cursor = (float(event.xdata), float(event.ydata))
+        self.cursor_x.set(f"{self.last_cursor[0]:.6f}")
+        self.cursor_y.set(f"{self.last_cursor[1]:.4f}")
+        self._update_cursor_overlay()
+
+    def _leave(self, _event: Any | None = None) -> None:
+        self.last_cursor = None
+        self.cursor_x.set("--")
+        self.cursor_y.set("--")
+        self._update_cursor_overlay()
+
+    def _reset_zoom(self) -> None:
+        self.range = self.default_range
+        self.status.set(
+            "View reset to the latest simulation bounds."
+        )
+        self._apply_range_to_axes()
+        self._schedule_canvas_state_log("after-reset-zoom")
+
+    def _redraw(self) -> None:
+        if self.axes is None or self.figure_canvas is None:
+            return
+
+        self.axes.clear()
+        self.axes.set_facecolor("white")
+        self.axes.grid(True, color="#d7d7d7", linewidth=0.8, alpha=0.65)
+        self.axes.set_xlabel("Wavelength (nm)")
+        self.axes.set_ylabel("20*log10(|E|) (dB)")
+
+        legend_handles: list[Any] = []
+        legend_labels: list[str] = []
+        if not self.groups:
+            self.axes.text(
+                0.5,
+                0.5,
+                "No curves to display.",
+                transform=self.axes.transAxes,
+                ha="center",
+                va="center",
+            )
+            self._log_info("Redraw skipped because there are no groups to display.")
+        else:
+            for group in self.groups:
+                group_line: Any | None = None
+                for index, curve in enumerate(group.curves):
+                    order = np.argsort(curve.wavelength_nm)
+                    x = curve.wavelength_nm[order]
+                    y = curve.magnitude_db()[order]
+                    if x.size < 2:
+                        continue
+                    color = _shade(self.colors[group.name], index, len(group.curves))
+                    (line,) = self.axes.plot(x, y, color=color, linewidth=2.4, alpha=0.96)
+                    marker_indices = sorted({0, x.size - 1, int(np.argmin(y)), int(np.argmax(y))})
+                    self.axes.scatter(
+                        x[marker_indices],
+                        y[marker_indices],
+                        s=24,
+                        color=color,
+                        zorder=3,
+                    )
+                    if group_line is None:
+                        group_line = line
+                if group_line is not None:
+                    legend_handles.append(group_line)
+                    legend_labels.append(group.name)
+
+            if legend_handles:
+                self.axes.legend(
+                    legend_handles,
+                    legend_labels,
+                    loc="upper right",
+                    frameon=True,
+                    framealpha=0.92,
+                )
+
+        self._apply_range_to_axes(draw=False)
+        self._install_cursor_overlay()
+        self.figure_canvas.draw_idle()
+
+    def _confirm(self) -> None:
+        self._cancel_pending_render_log()
+        self.result = TunableEditorResult(values=dict(self.current_values), saved_path=self.saved_path)
+        self.root.destroy()
+
+    def cancel(self) -> None:
+        self._cancel_pending_render_log()
+        self.cancelled = True
+        self.root.destroy()
+
+    @staticmethod
+    def _format_value(value: float) -> str:
+        return f"{float(value):.12g}"
+
+    def _log_info(self, message: str, *args: Any) -> None:
+        if self.logger is not None:
+            self.logger.info(message, *args)
+
+    def _log_exception(self, message: str) -> None:
+        if self.logger is not None:
+            self.logger.exception(message)
+
+    def _schedule_canvas_state_log(self, reason: str) -> None:
+        if self._pending_render_log_id is not None:
+            try:
+                self.root.after_cancel(self._pending_render_log_id)
+            except tk.TclError:
+                pass
+        self._pending_render_log_id = self.root.after(
+            120,
+            lambda: self._redraw_and_log_canvas_state(reason),
+        )
+
+    def _redraw_and_log_canvas_state(self, reason: str) -> None:
+        self._pending_render_log_id = None
+        if self.figure_canvas is None:
+            return
+        self.figure_canvas.draw()
+        self._log_canvas_state(reason)
+        self._export_canvas_snapshot(reason)
+
+    def _cancel_pending_render_log(self) -> None:
+        if self._pending_render_log_id is None:
+            return
+        try:
+            self.root.after_cancel(self._pending_render_log_id)
+        except tk.TclError:
+            pass
+        self._pending_render_log_id = None
+
+    def _axes_limits_changed(self, _axes: Any) -> None:
+        if self.axes is None or self._syncing_limits:
+            return
+        xlim = self.axes.get_xlim()
+        ylim = self.axes.get_ylim()
+        self.range = _PlotRange(
+            xmin=float(min(xlim)),
+            xmax=float(max(xlim)),
+            ymin=float(min(ylim)),
+            ymax=float(max(ylim)),
+        )
+
+    def _apply_range_to_axes(self, *, draw: bool = True) -> None:
+        if self.axes is None:
+            return
+        self._syncing_limits = True
+        try:
+            self.axes.set_xlim(self.range.xmin, self.range.xmax)
+            self.axes.set_ylim(self.range.ymin, self.range.ymax)
+        finally:
+            self._syncing_limits = False
+        self._update_cursor_overlay(draw=draw)
+
+    def _install_cursor_overlay(self) -> None:
+        if self.axes is None:
+            return
+        self.cursor_vline = self.axes.axvline(
+            0.0,
+            color="#666666",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.8,
+            visible=False,
+        )
+        self.cursor_hline = self.axes.axhline(
+            0.0,
+            color="#666666",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.8,
+            visible=False,
+        )
+        self.cursor_annotation = self.axes.annotate(
+            "",
+            xy=(0.0, 0.0),
+            xytext=(12, 12),
+            textcoords="offset points",
+            fontfamily="Consolas",
+            fontsize=9,
+            bbox={
+                "boxstyle": "round,pad=0.25",
+                "fc": "white",
+                "ec": "#909090",
+                "alpha": 0.94,
+            },
+        )
+        self.cursor_annotation.set_visible(False)
+        self._update_cursor_overlay(draw=False)
+
+    def _update_cursor_overlay(self, *, draw: bool = True) -> None:
+        if (
+            self.axes is None
+            or self.figure_canvas is None
+            or self.cursor_vline is None
+            or self.cursor_hline is None
+            or self.cursor_annotation is None
+        ):
+            return
+
+        if self.last_cursor is None:
+            self.cursor_vline.set_visible(False)
+            self.cursor_hline.set_visible(False)
+            self.cursor_annotation.set_visible(False)
+            if draw:
+                self.figure_canvas.draw_idle()
+            return
+
+        xdata, ydata = self.last_cursor
+        xmin, xmax = self.axes.get_xlim()
+        ymin, ymax = self.axes.get_ylim()
+        if not (xmin <= xdata <= xmax and ymin <= ydata <= ymax):
+            self.cursor_vline.set_visible(False)
+            self.cursor_hline.set_visible(False)
+            self.cursor_annotation.set_visible(False)
+            if draw:
+                self.figure_canvas.draw_idle()
+            return
+
+        xoffset = 12 if xdata <= xmin + 0.7 * (xmax - xmin) else -112
+        yoffset = 12 if ydata <= ymin + 0.7 * (ymax - ymin) else -44
+        self.cursor_vline.set_xdata([xdata, xdata])
+        self.cursor_hline.set_ydata([ydata, ydata])
+        self.cursor_vline.set_visible(True)
+        self.cursor_hline.set_visible(True)
+        self.cursor_annotation.xy = (xdata, ydata)
+        self.cursor_annotation.set_position((xoffset, yoffset))
+        self.cursor_annotation.set_text(f"x={xdata:.6f} nm\ny={ydata:.4f} dB")
+        self.cursor_annotation.set_visible(True)
+        if draw:
+            self.figure_canvas.draw_idle()
+
+    def _log_canvas_state(self, reason: str) -> None:
+        if self.logger is None or self.axes is None or self.figure_canvas is None:
+            return
+
+        lines = self.axes.get_lines()
+        detailed_lines: list[str] = []
+        for line in lines:
+            xdata = np.asarray(line.get_xdata(), dtype=float)
+            ydata = np.asarray(line.get_ydata(), dtype=float)
+            if xdata.size == 0 or ydata.size == 0:
+                continue
+            detailed_lines.append(
+                f"label={line.get_label()},points={xdata.size},"
+                f"start=({xdata[0]:.6f},{ydata[0]:.4f}),end=({xdata[-1]:.6f},{ydata[-1]:.4f})"
+            )
+        xlim = self.axes.get_xlim()
+        ylim = self.axes.get_ylim()
+        widget = self.figure_canvas.get_tk_widget()
+        self.logger.info(
+            "Figure state [%s]: canvas=%dx%d axes_lines=%d collections=%d texts=%d groups=%d xlim=(%.6f, %.6f) ylim=(%.6f, %.6f) detail=%s",
+            reason,
+            widget.winfo_width(),
+            widget.winfo_height(),
+            len(lines),
+            len(self.axes.collections),
+            len(self.axes.texts),
+            len(self.groups),
+            float(min(xlim)),
+            float(max(xlim)),
+            float(min(ylim)),
+            float(max(ylim)),
+            detailed_lines[:5],
+        )
+
+    def _export_canvas_snapshot(self, reason: str) -> None:
+        if self.logger is None or self.figure is None:
+            return
+
+        snapshot_path = self._snapshot_path(reason)
+        if snapshot_path is None:
+            return
+
+        try:
+            self.figure.savefig(snapshot_path, dpi=160, bbox_inches="tight")
+        except Exception:  # pragma: no cover - best-effort debug path
+            self._log_exception(f"Failed to export figure snapshot for reason={reason}")
+            return
+
+        self.logger.info("Figure snapshot [%s] exported to %s", reason, snapshot_path)
+
+    def _snapshot_path(self, reason: str) -> Path | None:
+        if self.logger is None:
+            return None
+
+        for handler in self.logger.handlers:
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            log_path = Path(handler.baseFilename)
+            safe_reason = re.sub(r"[^0-9A-Za-z_-]+", "_", reason.strip()) or "snapshot"
+            return log_path.with_name(f"{log_path.stem}_{safe_reason}.png")
+        return None
 
 
 class _Viewer:
