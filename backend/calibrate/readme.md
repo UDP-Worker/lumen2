@@ -29,7 +29,7 @@ $$
 - `calibrate_model.py` 已重构为纯曲线扫描流程。
 - `calibrate_control.py` 已重构为纯曲线扫描流程。
 - 零配置编辑器仍然保留，用于写入 `calibration.zero_config.tunable`。
-- `calibrate.py` 仍需要继续按“曲线形状匹配”思路重构；本轮尚未修改它。
+- `calibrate.py` 已重构为“曲线形状匹配 + 单调映射求解”流程。
 
 ## 代码说明
 
@@ -60,7 +60,12 @@ $$
 
 ### `calibrate.py`
 
-- 这个文件目前仍然是旧方案下的实现，后续需要改成直接比较模型曲线和控制曲线的形状，而不是比较消光比。
+- `run_voltage_to_tunable_calibration(...)` 是映射求解入口。它会读取模型侧和控制侧的曲线归档，并读取用户提供的“channel -> parameter”关系。
+- 对每个通道-参数配对，代码会逐条比较控制曲线与模型曲线，拟合
+  `T_real(lambda) ~= a * T_model(lambda + delta) + b`
+  中的 `a`、`b`、`delta`，用拟合残差和相关系数衡量形状是否匹配。
+- 在每个通道内部，代码会对“电压排序后的控制曲线”和“参数排序后的模型曲线”做单调路径搜索，确保得到的离散对应关系整体上是单调的。
+- 得到离散对应点后，代码再做带权保序回归，并用 `PCHIP` 生成连续的 `voltage -> parameter` 映射采样表。
 
 ## `calibrate_model.py` 用法
 
@@ -201,7 +206,53 @@ python -m backend.calibrate.calibrate_control backend/model/YAML/ramzi.yml --cha
 - `results.<channel>.sweep_values` 表示该通道本次实际施加的电压值。
 - `results.<channel>.curve_archive_prefix` 用于在 `control_calibration_curves.npz` 中定位这一组曲线。
 
-## 下一步
+## `calibrate.py` 用法
 
-- `calibrate.py` 需要继续重构为“曲线形状匹配”方案。
-- 到那一步时，程序需要读取 `model_calibration_curves.npz` 和 `control_calibration_curves.npz`，并结合用户提供的“通道 -> 可调参数”关系求解映射。
+### 前提
+
+- 必须先已经运行过 `calibrate_model.py` 和 `calibrate_control.py`，得到各自的 `.json` 和 `.npz` 文件。
+- 必须明确给出“哪个通道影响哪个可调参数”。可以写在 YAML 里：
+
+```yaml
+calibration:
+  voltage_to_tunable:
+    channel_to_parameter:
+      1: fai1
+      2: theta1
+```
+
+- 也可以通过 CLI 覆盖：
+
+```bash
+python -m backend.calibrate.calibrate backend/model/YAML/ramzi.yml --channel-parameter-map 1=fai1 2=theta1
+```
+
+### 正式求解命令
+
+```bash
+python -m backend.calibrate.calibrate backend/model/YAML/ramzi.yml
+```
+
+常用参数：
+
+- `--model-calibration path/to/model_calibration.json`
+- `--control-calibration path/to/control_calibration.json`
+- `--channel-parameter-map 1=fai1 2=theta1`
+- `--max-delta-nm 0.05`
+- `--smooth-window 7`
+- `--acceptance-cost 0.2`
+- `--min-correlation 0.85`
+- `--mapping-grid-points 256`
+
+### 程序会做什么
+
+1. 读取模型侧和控制侧的曲线结果。
+2. 对用户指定的每个通道-参数配对，逐条比较控制曲线和模型曲线的形状。
+3. 对每一对候选曲线拟合 `a`、`b`、`delta`，记录拟合误差、相关系数和波长偏移。
+4. 在每个通道内部，求一条整体单调的离散匹配路径。
+5. 对离散对应点做保序回归和平滑插值，得到最终的 `voltage -> parameter` 映射表。
+
+### 输出结果
+
+- `voltage_to_tunable_mapping.json`
+  - 记录每个通道对应的参数名、匹配方向、离散匹配点、保序后的参数值、连续映射采样表以及逐曲线的拟合诊断信息。
