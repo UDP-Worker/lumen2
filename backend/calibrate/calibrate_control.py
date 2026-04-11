@@ -14,18 +14,16 @@ from backend.calibrate._shared import (
     CurveSweepBundle,
     bundle_from_power_sweeps,
     ensure_output_dir,
-    estimate_zero_crossing,
-    extinction_ratio_db,
     get_mapping,
     get_sequence,
     load_raw_yaml,
-    ordered_selection_records,
     resolve_model_name,
     save_curve_archives,
+    sanitize_key,
     summarize_curve_bundle,
     write_json,
 )
-from backend.interface.OSA import read_power_at_wavelengths, read_spectrum
+from backend.interface.OSA import read_spectrum
 from backend.interface.VoltageSource import (
     configure_channel_limits,
     connect_voltage_source,
@@ -33,24 +31,17 @@ from backend.interface.VoltageSource import (
     set_channel_voltages,
 )
 from backend.model import load_model_config
-from backend.utils.complex_response_viewer import (
-    SelectionCancelledError,
-    SelectionRecord,
-    select_variable_targets,
-)
 
 
 @dataclass(slots=True)
 class ControlCalibrationSettings:
     channels: list[int]
     com_port: int
-    vmax: float | None
-    imax: float | None
+    vmax: float
+    imax: float
     settle_time_s: float
-    initialization_offsets: NDArray[np.float64]
     calibration_offsets: NDArray[np.float64]
-    initial_voltages: dict[int, float]
-    shared_baseline: bool
+    zero_voltages: dict[int, float]
     osa_settings: dict[str, Any]
 
 
@@ -62,8 +53,8 @@ def run_control_calibration(
     vmax: float | None = None,
     imax: float | None = None,
     settle_time_s: float | None = None,
-    initialization_offsets: Sequence[float] | None = None,
     calibration_offsets: Sequence[float] | None = None,
+    zero_voltages: Mapping[int, float] | None = None,
     output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     raw_config = load_raw_yaml(config_path)
@@ -81,109 +72,46 @@ def run_control_calibration(
         vmax=vmax,
         imax=imax,
         settle_time_s=settle_time_s,
-        initialization_offsets=initialization_offsets,
         calibration_offsets=calibration_offsets,
+        zero_voltages=zero_voltages,
+    )
+    logger.info(
+        "Starting control curve capture: channels=%s, zero_voltages=%s, vmax=%.6f, imax=%.6f",
+        settings.channels,
+        settings.zero_voltages,
+        settings.vmax,
+        settings.imax,
     )
 
-    current_voltages = dict(settings.initial_voltages)
-    initialization_bundles: list[CurveSweepBundle] = []
+    current_voltages = dict(settings.zero_voltages)
     calibration_bundles: list[CurveSweepBundle] = []
-    zeroing_history: dict[str, Any] = {}
     calibration_results: dict[str, Any] = {}
-    initialization_curve_targets: dict[int, list[SelectionRecord]] = {}
 
     engine = connect_voltage_source(settings.com_port)
     try:
-        if settings.vmax is not None or settings.imax is not None:
-            configure_channel_limits(
-                settings.channels,
-                vmax=settings.vmax,
-                imax=settings.imax,
-                engine=engine,
-            )
+        configure_channel_limits(
+            settings.channels,
+            vmax=settings.vmax,
+            imax=settings.imax,
+            engine=engine,
+        )
 
         _apply_voltages(current_voltages, engine=engine, settle_time_s=settings.settle_time_s)
 
         for channel in settings.channels:
-            sweep_values = current_voltages[channel] + settings.initialization_offsets
-            bundle = _capture_spectrum_bundle(
+            sweep_values = settings.zero_voltages[channel] + settings.calibration_offsets
+            _validate_voltage_sweep(
                 channel,
                 sweep_values,
-                current_voltages,
-                osa_settings=settings.osa_settings,
-                settle_time_s=settings.settle_time_s,
-                engine=engine,
+                zero_voltage=settings.zero_voltages[channel],
+                vmax=settings.vmax,
             )
-            initialization_bundles.append(bundle)
-
-        initialization_groups: list[Any] = []
-        initialization_target_maps: dict[int, dict[str, int]] = {}
-        for bundle in initialization_bundles:
-            groups, target_to_index = bundle.to_single_curve_groups()
-            initialization_groups.extend(groups)
-            initialization_target_maps[int(bundle.metadata["channel"])] = target_to_index
-
-        viewer_result = select_variable_targets(
-            initialization_groups,
-            title="Control calibration: choose through/extinction wavelengths",
-            shared_baseline=False,
-            logger=logger,
-        )
-
-        for bundle in initialization_bundles:
-            channel = int(bundle.metadata["channel"])
-            bundle_selections = {
-                name: record
-                for name, record in viewer_result.selections.items()
-                if name in initialization_target_maps[channel]
-            }
-            initialization_curve_targets[channel] = ordered_selection_records(
-                initialization_target_maps[channel],
-                bundle_selections,
-                expected_count=len(bundle.sweep_values),
-            )
-        logger.info(
-            "Initialization wavelength targets selected: %s",
-            {
-                str(channel): len(records)
-                for channel, records in initialization_curve_targets.items()
-            },
-        )
-
-        for bundle in initialization_bundles:
-            channel = int(bundle.metadata["channel"])
-            curve_selections = initialization_curve_targets[channel]
-            candidate_voltages = current_voltages[channel] + settings.initialization_offsets
-            through_power_samples, extinction_power_samples = _measure_target_powers(
-                channel,
-                candidate_voltages,
-                current_voltages,
-                curve_selections=curve_selections,
-                osa_settings=settings.osa_settings,
-                settle_time_s=settings.settle_time_s,
-                engine=engine,
-            )
-            er_samples = extinction_ratio_db(through_power_samples, extinction_power_samples)
-            zero_voltage = estimate_zero_crossing(candidate_voltages, er_samples)
-            current_voltages[channel] = float(zero_voltage)
-            _apply_voltages(current_voltages, engine=engine, settle_time_s=settings.settle_time_s)
             logger.info(
-                "Zero search for channel %d used %d curve-specific selections and chose %.6f V.",
+                "Capturing channel %d around zero voltage %.6f with %d sweep samples.",
                 channel,
-                len(curve_selections),
-                zero_voltage,
+                settings.zero_voltages[channel],
+                len(sweep_values),
             )
-            zeroing_history[str(channel)] = {
-                "curve_selections": _serialize_curve_selections(bundle, curve_selections),
-                "candidate_voltages": [float(value) for value in candidate_voltages],
-                "power_db_at_through_wavelength": [float(value) for value in through_power_samples],
-                "power_db_at_extinction_wavelength": [float(value) for value in extinction_power_samples],
-                "extinction_ratio_db": [float(value) for value in er_samples],
-                "chosen_zero_voltage": float(zero_voltage),
-            }
-
-        for channel in settings.channels:
-            sweep_values = current_voltages[channel] + settings.calibration_offsets
             bundle = _capture_spectrum_bundle(
                 channel,
                 sweep_values,
@@ -193,50 +121,23 @@ def run_control_calibration(
                 engine=engine,
             )
             calibration_bundles.append(bundle)
-            curve_groups, target_to_index = bundle.to_single_curve_groups()
-            viewer_result = select_variable_targets(
-                curve_groups,
-                title=f"Control calibration: channel {channel}",
-                shared_baseline=False,
-                logger=logger,
-            )
-            curve_selections = ordered_selection_records(
-                target_to_index,
-                viewer_result.selections,
-                expected_count=len(bundle.sweep_values),
-            )
-
             logger.info(
-                "Formal calibration for channel %d is using %d curve-specific selections around zero %.6f V.",
+                "Captured %d curves for channel %d over sweep range %.6f -> %.6f.",
+                len(bundle.sweep_values),
                 channel,
-                len(curve_selections),
-                current_voltages[channel],
+                float(np.min(bundle.sweep_values)),
+                float(np.max(bundle.sweep_values)),
             )
-            through_power_samples = bundle.power_db_at_curve_wavelengths(
-                [record.through_wavelength_nm for record in curve_selections]
-            )
-            extinction_power_samples = bundle.power_db_at_curve_wavelengths(
-                [record.extinction_wavelength_nm for record in curve_selections]
-            )
-            er_samples = extinction_ratio_db(through_power_samples, extinction_power_samples)
             calibration_results[str(channel)] = {
-                "curve_selections": _serialize_curve_selections(bundle, curve_selections),
-                "zero_voltage": float(current_voltages[channel]),
+                "zero_voltage": float(settings.zero_voltages[channel]),
+                "curve_archive_prefix": sanitize_key(bundle.name),
                 "sweep_values": [float(value) for value in bundle.sweep_values],
-                "power_db_at_through_wavelength": [float(value) for value in through_power_samples],
-                "power_db_at_extinction_wavelength": [
-                    float(value) for value in extinction_power_samples
-                ],
-                "extinction_ratio_db": [float(value) for value in er_samples],
+                "curve_count": int(bundle.sweep_values.size),
                 "curve_summary": summarize_curve_bundle(bundle),
             }
     finally:
         disconnect_voltage_source(engine, stop_engine=True)
 
-    initialization_archive = save_curve_archives(
-        destination_dir / "control_initialization_curves.npz",
-        initialization_bundles,
-    )
     calibration_archive = save_curve_archives(
         destination_dir / "control_calibration_curves.npz",
         calibration_bundles,
@@ -251,49 +152,18 @@ def run_control_calibration(
             "vmax": settings.vmax,
             "imax": settings.imax,
             "settle_time_s": settings.settle_time_s,
-            "initialization_offsets": [float(value) for value in settings.initialization_offsets],
             "calibration_offsets": [float(value) for value in settings.calibration_offsets],
-            "initial_voltages": {str(key): float(value) for key, value in settings.initial_voltages.items()},
-            "shared_baseline": settings.shared_baseline,
+            "zero_voltages": {str(key): float(value) for key, value in settings.zero_voltages.items()},
             "osa_settings": settings.osa_settings,
         },
-        "channel_targets": {
-            str(int(bundle.metadata["channel"])): _serialize_curve_selections(
-                bundle,
-                initialization_curve_targets[int(bundle.metadata["channel"])],
-            )
-            for bundle in initialization_bundles
-        },
-        "zero_voltages": {str(channel): float(value) for channel, value in current_voltages.items()},
-        "initialization": {
-            "curve_archive": str(initialization_archive),
-            "curve_summaries": {
-                bundle.name: summarize_curve_bundle(bundle) for bundle in initialization_bundles
-            },
-            "zeroing_history": zeroing_history,
-        },
+        "channel_order": settings.channels,
+        "zero_voltages": {str(channel): float(value) for channel, value in settings.zero_voltages.items()},
         "results": calibration_results,
         "curve_archive": str(calibration_archive),
     }
     json_path = write_json(destination_dir / "control_calibration.json", payload)
     payload["json_path"] = str(json_path)
     return payload
-
-
-def _serialize_curve_selections(
-    bundle: CurveSweepBundle,
-    curve_selections: Sequence[SelectionRecord],
-) -> list[dict[str, Any]]:
-    return [
-        {
-            "curve_index": int(index),
-            "curve_label": f"{bundle.name}={float(bundle.sweep_values[index]):+.6g}",
-            "sweep_value": float(bundle.sweep_values[index]),
-            "through_wavelength_nm": float(record.through_wavelength_nm),
-            "extinction_wavelength_nm": float(record.extinction_wavelength_nm),
-        }
-        for index, record in enumerate(curve_selections)
-    ]
 
 
 def _resolve_settings(
@@ -305,8 +175,8 @@ def _resolve_settings(
     vmax: float | None,
     imax: float | None,
     settle_time_s: float | None,
-    initialization_offsets: Sequence[float] | None,
     calibration_offsets: Sequence[float] | None,
+    zero_voltages: Mapping[int, float] | None,
 ) -> ControlCalibrationSettings:
     calibration_section = get_mapping(raw_config, "calibration")
     control_section = get_mapping(calibration_section, "control")
@@ -316,17 +186,40 @@ def _resolve_settings(
     resolved_channels = [int(value) for value in (channels or get_sequence(control_section, "channels"))]
     if not resolved_channels:
         raise ValueError("Control calibration requires at least one channel.")
+    if len(set(resolved_channels)) != len(resolved_channels):
+        raise ValueError("Control calibration channels must not contain duplicates.")
 
     resolved_com_port = com_port if com_port is not None else voltage_section.get("com_port")
     if resolved_com_port is None:
         raise ValueError("Control calibration requires com_port or calibration.control.voltage_source.com_port.")
 
-    initial_voltage_section = control_section.get("initial_voltages")
-    initial_voltages = {channel: 0.0 for channel in resolved_channels}
-    if isinstance(initial_voltage_section, Mapping):
-        for channel in resolved_channels:
-            raw_value = initial_voltage_section.get(channel, initial_voltage_section.get(str(channel), 0.0))
-            initial_voltages[channel] = float(raw_value)
+    resolved_vmax_raw = vmax if vmax is not None else voltage_section.get("vmax")
+    resolved_imax_raw = imax if imax is not None else voltage_section.get("imax")
+    if resolved_vmax_raw is None or resolved_imax_raw is None:
+        raise ValueError(
+            "Control calibration requires both vmax and imax. "
+            "Provide them via CLI or calibration.control.voltage_source."
+        )
+    if float(resolved_vmax_raw) <= 0.0:
+        raise ValueError("Control calibration requires vmax to be positive.")
+    if float(resolved_imax_raw) <= 0.0:
+        raise ValueError("Control calibration requires imax to be positive.")
+
+    zero_voltage_section = zero_voltages or _resolve_zero_voltage_mapping(control_section)
+    resolved_zero_voltages: dict[int, float] = {}
+    for channel in resolved_channels:
+        if channel not in zero_voltage_section:
+            raise ValueError(
+                "Control calibration requires zero voltages for every channel. "
+                f"Missing channel {channel}."
+            )
+        resolved_zero_voltages[channel] = float(zero_voltage_section[channel])
+        _validate_voltage_limit(
+            channel,
+            resolved_zero_voltages[channel],
+            vmax=float(resolved_vmax_raw),
+            label="zero voltage",
+        )
 
     wavelength_section = resolved_config["simulation"]["wavelength_nm"]
     osa_section.setdefault("lam_start_nm", float(wavelength_section["start"]))
@@ -338,48 +231,53 @@ def _resolve_settings(
     osa_section.setdefault("plot_result", False)
     osa_section.setdefault("record", False)
 
+    resolved_offsets = np.asarray(
+        calibration_offsets
+        if calibration_offsets is not None
+        else get_sequence(
+            control_section,
+            "calibration_offsets",
+            default=(-0.4, -0.2, 0.0, 0.2, 0.4),
+        ),
+        dtype=float,
+    )
+    if resolved_offsets.ndim != 1 or resolved_offsets.size < 2:
+        raise ValueError("Control calibration requires at least two calibration offsets.")
+
     return ControlCalibrationSettings(
         channels=resolved_channels,
         com_port=int(resolved_com_port),
-        vmax=float(vmax if vmax is not None else voltage_section.get("vmax"))
-        if (vmax is not None or voltage_section.get("vmax") is not None)
-        else None,
-        imax=float(imax if imax is not None else voltage_section.get("imax"))
-        if (imax is not None or voltage_section.get("imax") is not None)
-        else None,
+        vmax=float(resolved_vmax_raw),
+        imax=float(resolved_imax_raw),
         settle_time_s=float(settle_time_s if settle_time_s is not None else control_section.get("settle_time_s", 0.5)),
-        initialization_offsets=np.asarray(
-            initialization_offsets
-            if initialization_offsets is not None
-            else get_sequence(
-                control_section,
-                "initialization_offsets",
-                default=(-0.2, -0.1, 0.0, 0.1, 0.2),
-            ),
-            dtype=float,
-        ),
-        calibration_offsets=np.asarray(
-            calibration_offsets
-            if calibration_offsets is not None
-            else get_sequence(
-                control_section,
-                "calibration_offsets",
-                default=(-0.4, -0.2, 0.0, 0.2, 0.4),
-            ),
-            dtype=float,
-        ),
-        initial_voltages=initial_voltages,
-        shared_baseline=bool(control_section.get("shared_baseline", True)),
+        calibration_offsets=resolved_offsets,
+        zero_voltages=resolved_zero_voltages,
         osa_settings=osa_section,
     )
 
 
+def _resolve_zero_voltage_mapping(control_section: Mapping[str, Any]) -> dict[int, float]:
+    raw_mapping = control_section.get("zero_voltages")
+    if raw_mapping is None:
+        raw_mapping = control_section.get("initial_voltages")
+    if not isinstance(raw_mapping, Mapping):
+        raise ValueError(
+            "Control calibration requires calibration.control.zero_voltages "
+            "(or legacy calibration.control.initial_voltages)."
+        )
+
+    resolved: dict[int, float] = {}
+    for key, value in raw_mapping.items():
+        resolved[int(key)] = float(value)
+    return resolved
+
+
 def _build_control_calibration_logger(model_name: str, destination_dir: Path) -> logging.Logger:
-    logger = logging.getLogger(f"backend.calibrate.control_selection.{model_name}")
+    logger = logging.getLogger(f"backend.calibrate.control_curve_capture.{model_name}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    log_path = destination_dir / "control_calibration_viewer.log"
+    log_path = destination_dir / "control_calibration.log"
     resolved_log_path = log_path.resolve()
     for handler in list(logger.handlers):
         if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == resolved_log_path:
@@ -438,40 +336,6 @@ def _capture_spectrum_bundle(
     )
 
 
-def _measure_target_powers(
-    channel: int,
-    sweep_values: Sequence[float],
-    base_voltages: Mapping[int, float],
-    *,
-    curve_selections: Sequence[SelectionRecord],
-    osa_settings: Mapping[str, Any],
-    settle_time_s: float,
-    engine: Any,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    if len(curve_selections) != len(sweep_values):
-        raise ValueError("curve_selections must contain one selection record per sweep value.")
-
-    through_powers: list[float] = []
-    extinction_powers: list[float] = []
-    for value, selection in zip(sweep_values, curve_selections, strict=True):
-        trial = dict(base_voltages)
-        trial[channel] = float(value)
-        _apply_voltages(trial, engine=engine, settle_time_s=settle_time_s)
-        _, selected_powers = read_power_at_wavelengths(
-            [
-                float(selection.through_wavelength_nm),
-                float(selection.extinction_wavelength_nm),
-            ],
-            engine=engine,
-            **osa_settings,
-        )
-        through_powers.append(float(selected_powers[0]))
-        extinction_powers.append(float(selected_powers[1]))
-
-    _apply_voltages(base_voltages, engine=engine, settle_time_s=settle_time_s)
-    return np.asarray(through_powers, dtype=float), np.asarray(extinction_powers, dtype=float)
-
-
 def _apply_voltages(
     channel_to_voltage: Mapping[int, float],
     *,
@@ -483,33 +347,79 @@ def _apply_voltages(
         time.sleep(float(settle_time_s))
 
 
+def _validate_voltage_sweep(
+    channel: int,
+    sweep_values: Sequence[float],
+    *,
+    zero_voltage: float,
+    vmax: float,
+) -> None:
+    _validate_voltage_limit(channel, zero_voltage, vmax=vmax, label="zero voltage")
+    for index, value in enumerate(sweep_values):
+        _validate_voltage_limit(channel, float(value), vmax=vmax, label=f"sweep value #{index}")
+
+
+def _validate_voltage_limit(
+    channel: int,
+    voltage: float,
+    *,
+    vmax: float,
+    label: str,
+) -> None:
+    if abs(float(voltage)) > float(vmax):
+        raise ValueError(
+            f"Channel {channel} {label} {float(voltage):.6f} V exceeds configured |vmax| {float(vmax):.6f} V."
+        )
+
+
+def _parse_zero_voltage_overrides(values: Sequence[str] | None) -> dict[int, float] | None:
+    if values is None:
+        return None
+
+    parsed: dict[int, float] = {}
+    for item in values:
+        if "=" not in item:
+            raise ValueError(
+                "Zero-voltage overrides must use CHANNEL=VOLTAGE syntax, "
+                f"but got {item!r}."
+            )
+        channel_text, voltage_text = item.split("=", 1)
+        parsed[int(channel_text.strip())] = float(voltage_text.strip())
+    return parsed
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Calibrate control voltages against extinction ratio.")
+    parser = argparse.ArgumentParser(
+        description="Capture control-side voltage sweep curves for later shape-based calibration."
+    )
     parser.add_argument("config", type=Path, help="Path to the model YAML config.")
     parser.add_argument("--channels", nargs="+", type=int, default=None)
     parser.add_argument("--com-port", type=int, default=None)
     parser.add_argument("--vmax", type=float, default=None)
     parser.add_argument("--imax", type=float, default=None)
     parser.add_argument("--settle-time-s", type=float, default=None)
-    parser.add_argument("--initialization-offsets", nargs="+", type=float, default=None)
     parser.add_argument("--calibration-offsets", nargs="+", type=float, default=None)
+    parser.add_argument(
+        "--zero-voltages",
+        nargs="+",
+        default=None,
+        metavar="CHANNEL=VOLTAGE",
+        help="Per-channel zero voltages, for example `--zero-voltages 1=0.0 2=0.15`.",
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    try:
-        payload = run_control_calibration(
-            args.config,
-            channels=args.channels,
-            com_port=args.com_port,
-            vmax=args.vmax,
-            imax=args.imax,
-            settle_time_s=args.settle_time_s,
-            initialization_offsets=args.initialization_offsets,
-            calibration_offsets=args.calibration_offsets,
-            output_dir=args.output_dir,
-        )
-    except SelectionCancelledError:
-        return 1
+    payload = run_control_calibration(
+        args.config,
+        channels=args.channels,
+        com_port=args.com_port,
+        vmax=args.vmax,
+        imax=args.imax,
+        settle_time_s=args.settle_time_s,
+        calibration_offsets=args.calibration_offsets,
+        zero_voltages=_parse_zero_voltage_overrides(args.zero_voltages),
+        output_dir=args.output_dir,
+    )
 
     print(f"saved_json: {payload['json_path']}")
     print(f"model_name: {payload['model_name']}")
