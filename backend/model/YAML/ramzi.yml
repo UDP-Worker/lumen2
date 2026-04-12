@@ -88,3 +88,47 @@ calibration:
       theta2: 3.14159
       theta3: 3.14159
       theta4: 3.14159
+optimization:
+  target:
+    center_nm: 1550.0
+    bandwidth_3db_nm: 0.005
+    transition_nm: 0.005
+  weights:
+    passband: 4.0
+    stopband: 4.0
+    ripple: 0.5
+    center: 1.5
+    bandwidth: 1.5
+    constraint: 100.0
+  parameterization:
+    mode: grouped
+    include_unlisted: false
+    groups:
+      fai_pair_1:
+        members: [fai1, fai3]
+      fai_pair_2:
+        members: [fai2, fai4]
+      theta_pair_1:
+        members: [theta1, theta3]
+      theta_pair_2:
+        members: [theta2, theta4]
+  strategy:
+    global:
+      enabled: true
+      maxiter: 100
+      popsize: 4
+      polish: false
+      seed: 42
+      tol: 0.01
+      mutation: [0.5, 1.0]
+      recombination: 0.7
+    local:
+      enabled: true
+      method: Powell
+      maxiter: 50
+      xtol: 0.001
+      ftol: 0.001
+  max_evaluations: 200
+  logging:
+    tensorboard: true
+    plot_every: 2

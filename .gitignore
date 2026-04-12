@@ -5,7 +5,7 @@ Thumbs.db
 agent.md
 # 日志
 backend/calibrate/data
-
+backend/optimize/data
 # Python
 __pycache__/
 *.py[cod]
