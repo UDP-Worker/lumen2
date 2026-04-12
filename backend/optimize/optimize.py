@@ -39,6 +39,7 @@ class OptimizationTarget:
     center_nm: float
     bandwidth_3db_nm: float
     transition_nm: float
+    contrast_min_linear: float = 0.8
 
 
 @dataclass(slots=True)
@@ -48,6 +49,8 @@ class LossWeights:
     ripple: float = 0.5
     center: float = 1.5
     bandwidth: float = 1.5
+    peak: float = 10.0
+    contrast: float = 50.0
     constraint: float = 100.0
 
 
@@ -205,6 +208,10 @@ class OptimizationBudgetExceeded(RuntimeError):
     pass
 
 
+class StageBudgetExceeded(RuntimeError):
+    pass
+
+
 class TensorBoardScalarLogger:
     def __init__(self, log_dir: Path) -> None:
         from tensorboard.compat.proto.event_pb2 import Event
@@ -291,11 +298,14 @@ class OptimizationRecorder:
             "stopband_max_linear",
             "passband_ripple_linear",
             "extinction_ratio_db",
+            "peak_minus_stopband_mean_linear",
             "loss_passband",
             "loss_stopband",
             "loss_ripple",
             "loss_center",
             "loss_bandwidth",
+            "loss_peak",
+            "loss_contrast",
             "loss_constraint",
         ]
         fields.extend(f"decision__{variable.name}" for variable in self.parameterization.decision_variables)
@@ -323,11 +333,14 @@ class OptimizationRecorder:
             "stopband_max_linear": float(evaluation.metrics["stopband_max_linear"]),
             "passband_ripple_linear": float(evaluation.metrics["passband_ripple_linear"]),
             "extinction_ratio_db": float(evaluation.metrics["extinction_ratio_db"]),
+            "peak_minus_stopband_mean_linear": float(evaluation.metrics["peak_minus_stopband_mean_linear"]),
             "loss_passband": float(evaluation.loss_terms["passband"]),
             "loss_stopband": float(evaluation.loss_terms["stopband"]),
             "loss_ripple": float(evaluation.loss_terms["ripple"]),
             "loss_center": float(evaluation.loss_terms["center"]),
             "loss_bandwidth": float(evaluation.loss_terms["bandwidth"]),
+            "loss_peak": float(evaluation.loss_terms["peak"]),
+            "loss_contrast": float(evaluation.loss_terms["contrast"]),
             "loss_constraint": float(evaluation.loss_terms["constraint"]),
         }
         csv_row.update(
@@ -353,6 +366,8 @@ class OptimizationRecorder:
                 "loss/ripple": evaluation.loss_terms["ripple"],
                 "loss/center": evaluation.loss_terms["center"],
                 "loss/bandwidth": evaluation.loss_terms["bandwidth"],
+                "loss/peak": evaluation.loss_terms["peak"],
+                "loss/contrast": evaluation.loss_terms["contrast"],
                 "loss/constraint": evaluation.loss_terms["constraint"],
                 "metrics/peak_wavelength_nm": evaluation.metrics["peak_wavelength_nm"],
                 "metrics/peak_power_linear": evaluation.metrics["peak_power_linear"],
@@ -363,6 +378,7 @@ class OptimizationRecorder:
                 "metrics/stopband_max_linear": evaluation.metrics["stopband_max_linear"],
                 "metrics/passband_ripple_linear": evaluation.metrics["passband_ripple_linear"],
                 "metrics/extinction_ratio_db": evaluation.metrics["extinction_ratio_db"],
+                "metrics/peak_minus_stopband_mean_linear": evaluation.metrics["peak_minus_stopband_mean_linear"],
                 "meta/elapsed_seconds": evaluation.elapsed_seconds,
             }
             tensorboard_scalars.update(
@@ -703,7 +719,16 @@ class OptimizationRunner:
         stopband_mean_linear = float(np.mean(stopband_values))
         stopband_max_linear = float(np.max(stopband_values))
         passband_ripple_linear = float(np.ptp(passband_values))
+        peak_minus_stopband_mean_linear = peak_power_linear - stopband_mean_linear
         extinction_ratio_db = float(np.mean(passband_values_db) - _linear_power_to_db(stopband_max_linear))
+        peak_error = float((1.0 - peak_power_linear) ** 2)
+        contrast_gap = max(self.target.contrast_min_linear - peak_minus_stopband_mean_linear, 0.0)
+        contrast_error = float(contrast_gap**2)
+
+        loss_terms["peak"] = self.weights.peak * peak_error
+        loss_terms["contrast"] = self.weights.contrast * contrast_error
+        total_loss = float(sum(loss_terms.values()))
+
         metrics = {
             "peak_wavelength_nm": peak_wavelength_nm,
             "peak_power_linear": peak_power_linear,
@@ -715,6 +740,7 @@ class OptimizationRunner:
             "stopband_max_linear": stopband_max_linear,
             "passband_ripple_linear": passband_ripple_linear,
             "extinction_ratio_db": extinction_ratio_db,
+            "peak_minus_stopband_mean_linear": float(peak_minus_stopband_mean_linear),
         }
         return total_loss, loss_terms, metrics
 
@@ -771,6 +797,13 @@ def run_filter_optimization(
     if skip_local:
         local_settings.enabled = False
 
+    reserved_local_budget = _resolve_local_budget_reserve(
+        total_budget=default_budget,
+        parameter_dimension=parameterization.dimension,
+        local_enabled=local_settings.enabled,
+    )
+    global_budget_limit = max(default_budget - reserved_local_budget, 1)
+
     run_dir = _resolve_run_dir(output_dir=output_dir, model_name=model_name)
     runner = OptimizationRunner(
         raw_config=raw_config,
@@ -799,9 +832,17 @@ def run_filter_optimization(
 
         if global_settings.enabled:
             runner.set_stage("global")
+
+            def global_objective(vector: Sequence[float]) -> float:
+                if runner.evaluation_count >= global_budget_limit:
+                    raise StageBudgetExceeded(
+                        f"Reached the global stage budget ({global_budget_limit} simulations)."
+                    )
+                return runner.objective(vector)
+
             try:
                 differential_result = differential_evolution(
-                    runner.objective,
+                    global_objective,
                     bounds=parameterization.bounds(),
                     strategy=global_settings.strategy,
                     maxiter=global_settings.maxiter,
@@ -816,6 +857,11 @@ def run_filter_optimization(
                 )
                 global_result = _serialize_optimize_result(differential_result)
                 current_best_vector = np.asarray(differential_result.x, dtype=float)
+            except StageBudgetExceeded as exc:
+                global_result = {
+                    "status": "stage_budget_exhausted",
+                    "message": str(exc),
+                }
             except OptimizationBudgetExceeded as exc:
                 termination_reason = str(exc)
                 global_result = {
@@ -888,10 +934,12 @@ def run_filter_optimization(
         "weights": asdict(weights),
         "global_stage": {
             **asdict(global_settings),
+            "budget_limit": int(global_budget_limit),
             "result": global_result,
         },
         "local_stage": {
             **asdict(local_settings),
+            "reserved_budget": int(reserved_local_budget),
             "result": local_result,
         },
         "logging": {
@@ -983,9 +1031,12 @@ def _resolve_optimization_settings(
         center_nm=float(target_section.get("center_nm", 1550.0)),
         bandwidth_3db_nm=bandwidth_3db_nm,
         transition_nm=float(target_section.get("transition_nm", max(bandwidth_3db_nm * 0.5, 4.0 * wavelength_step))),
+        contrast_min_linear=float(target_section.get("contrast_min_linear", 0.8)),
     )
     if target.transition_nm < 0.0:
         raise ValueError("optimization.target.transition_nm must be non-negative.")
+    if target.contrast_min_linear < 0.0:
+        raise ValueError("optimization.target.contrast_min_linear must be non-negative.")
 
     weights = LossWeights(
         passband=float(weights_section.get("passband", DEFAULT_LOSS_WEIGHTS.passband)),
@@ -993,6 +1044,8 @@ def _resolve_optimization_settings(
         ripple=float(weights_section.get("ripple", DEFAULT_LOSS_WEIGHTS.ripple)),
         center=float(weights_section.get("center", DEFAULT_LOSS_WEIGHTS.center)),
         bandwidth=float(weights_section.get("bandwidth", DEFAULT_LOSS_WEIGHTS.bandwidth)),
+        peak=float(weights_section.get("peak", DEFAULT_LOSS_WEIGHTS.peak)),
+        contrast=float(weights_section.get("contrast", DEFAULT_LOSS_WEIGHTS.contrast)),
         constraint=float(weights_section.get("constraint", DEFAULT_LOSS_WEIGHTS.constraint)),
     )
     global_settings = GlobalSettings(
@@ -1292,6 +1345,20 @@ def _resolve_run_dir(*, output_dir: str | Path | None, model_name: str) -> Path:
     run_dir = (OPTIMIZATION_DATA_ROOT / model_name / timestamp).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def _resolve_local_budget_reserve(
+    *,
+    total_budget: int,
+    parameter_dimension: int,
+    local_enabled: bool,
+) -> int:
+    if not local_enabled:
+        return 0
+    if total_budget <= 3:
+        return 1
+    auto_reserve = max(8, parameter_dimension * 4)
+    return int(min(auto_reserve, max(1, total_budget // 3)))
 
 
 def _serialize_optimize_result(result: Any) -> dict[str, Any]:

@@ -9,7 +9,7 @@ simulation:
     stop: 1550.2032
     step: 0.0002
 outputs:
-  observe_port: C2
+  observe_port: C1
 parameters:
   tunable:
     fai1:
@@ -93,25 +93,18 @@ optimization:
     center_nm: 1550.0
     bandwidth_3db_nm: 0.005
     transition_nm: 0.005
+    contrast_min_linear: 0.8
   weights:
-    passband: 4.0
-    stopband: 4.0
+    passband: 8.0
+    stopband: 12.0
     ripple: 0.5
-    center: 1.5
-    bandwidth: 1.5
+    center: 0.15
+    bandwidth: 0.1
+    peak: 10.0
+    contrast: 50.0
     constraint: 100.0
   parameterization:
-    mode: grouped
-    include_unlisted: false
-    groups:
-      fai_pair_1:
-        members: [fai1, fai3]
-      fai_pair_2:
-        members: [fai2, fai4]
-      theta_pair_1:
-        members: [theta1, theta3]
-      theta_pair_2:
-        members: [theta2, theta4]
+    mode: direct
   strategy:
     global:
       enabled: true

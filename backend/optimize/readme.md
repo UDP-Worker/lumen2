@@ -219,6 +219,7 @@ $$
 - `B_p` 是目标通带；
 - `B_s` 是去掉过渡带后的阻带；
 - `\hat{\lambda}_c` 和 `\widehat{BW}_{3\mathrm{dB}}` 由当前仿真光谱自动估计；
+- 当前实现还会额外加入峰值项和对比度项，用来抑制“全暗端口”和“全通端口”这类病态解；
 - `L_constraint` 来自 `parameters.constraints` 的违反量。
 
 ### 推荐写法示例
@@ -229,27 +230,20 @@ optimization:
     center_nm: 1550.0
     bandwidth_3db_nm: 0.005
     transition_nm: 0.005
+    contrast_min_linear: 0.8
 
   weights:
-    passband: 4.0
-    stopband: 4.0
+    passband: 8.0
+    stopband: 12.0
     ripple: 0.5
-    center: 1.5
-    bandwidth: 1.5
+    center: 0.15
+    bandwidth: 0.1
+    peak: 10.0
+    contrast: 50.0
     constraint: 100.0
 
   parameterization:
-    mode: grouped
-    include_unlisted: false
-    groups:
-      fai_pair_1:
-        members: [fai1, fai3]
-      fai_pair_2:
-        members: [fai2, fai4]
-      theta_pair_1:
-        members: [theta1, theta3]
-      theta_pair_2:
-        members: [theta2, theta4]
+    mode: direct
 
   strategy:
     global:
@@ -288,6 +282,9 @@ optimization:
 - `transition_nm`
   - 通带外侧留出的过渡带宽度，过渡带不计入阻带损失。
   - 默认值：`max(bandwidth_3db_nm / 2, 4 * simulation.wavelength_nm.step)`
+- `contrast_min_linear`
+  - 期望“峰值功率 - 阻带平均功率”至少达到的最小线性对比度。
+  - 默认值：`0.8`
 
 #### `optimization.weights`
 
@@ -309,6 +306,12 @@ optimization:
 - `constraint`
   - 参数约束违反惩罚权重。
   - 默认值：`100.0`
+- `peak`
+  - 峰值功率不足时的惩罚权重，用来避免优化器把整个端口压成全暗。
+  - 默认值：`10.0`
+- `contrast`
+  - 峰值与阻带平均功率对比度不足时的惩罚权重，用来避免“全暗”或“全通”病态解。
+  - 默认值：`50.0`
 
 #### `optimization.parameterization`
 
@@ -335,6 +338,7 @@ optimization:
 - 如果组内没写 `initial`，默认取组内成员当前值的平均值。
 - 如果组内没写 `bounds`，默认取各成员 bounds 的交集。
 - 如果某个 tunable 同时出现在多个组里，程序会报错。
+- 如果你当前 YAML 里的初值本身带有重要的非对称性，那么 `grouped` 或 `symmetric4` 可能会在优化开始前就把这个结构压坏；这时更建议先用 `mode: direct`。
 
 #### `optimization.strategy.global`
 
@@ -403,6 +407,259 @@ optimization:
 - 默认值：`24`
 
 这是一个硬限制。达到这个次数后，程序会停止继续搜索，并保留当前最优结果。
+
+补充说明：
+
+- 如果启用了局部优化，程序当前会自动为局部阶段预留一部分预算，避免全局阶段把全部仿真次数提前耗尽。
+
+## `max_evaluations`、`global.maxiter`、`local.maxiter` 到底是什么关系
+
+这一部分最容易混淆。最简单的理解方式是：
+
+- `max_evaluations`
+  - 管的是“整次优化最多允许做多少次 MATLAB 仿真”。
+  - 这是最硬的上限。
+- `strategy.global.maxiter`
+  - 管的是“全局优化最多跑多少代”。
+  - 它不是直接等于仿真次数。
+- `strategy.local.maxiter`
+  - 管的是“局部优化最多做多少轮迭代”。
+  - 它也不是直接等于仿真次数。
+- `strategy.local.maxfev`
+  - 管的是“局部优化最多允许做多少次目标函数评估”。
+  - 这个更接近真实的仿真次数限制。
+
+### 先记住一个总原则
+
+在当前实现里，真正决定“会不会提前停”的第一优先级是：
+
+1. `max_evaluations`
+2. 全局阶段预留给局部阶段后的 `global budget`
+3. 局部阶段自己的 `maxfev`
+4. `global.maxiter` / `local.maxiter`
+
+也就是说：
+
+- `global.maxiter` 和 `local.maxiter` 更像“算法层面的意愿上限”；
+- `max_evaluations` 才是“资源层面的硬上限”。
+
+如果预算不够，优化器还没把 `maxiter` 跑完，也会提前停。
+
+### 当前实现里实际怎么分配预算
+
+假设你写了：
+
+```yaml
+optimization:
+  max_evaluations: 60
+```
+
+并且 `local.enabled: true`，程序会先自动给局部阶段预留一部分预算：
+
+```text
+reserved_local_budget = min(max(8, 参数维度 * 4), max(1, max_evaluations // 3))
+global_budget_limit = max_evaluations - reserved_local_budget
+```
+
+所以：
+
+- 全局阶段不能无限吃掉全部预算；
+- 局部阶段至少还能拿到一部分仿真次数做精修。
+
+### 对你这个项目，参数维度会直接影响预算切分
+
+如果你是 `mode: direct`，RAMZI 现在有 8 个 tunable，所以参数维度是 8。
+
+这时如果：
+
+```yaml
+max_evaluations: 60
+```
+
+那么：
+
+- `参数维度 * 4 = 32`
+- `max(8, 32) = 32`
+- `max_evaluations // 3 = 20`
+- 所以 `reserved_local_budget = min(32, 20) = 20`
+- 于是 `global_budget_limit = 60 - 20 = 40`
+
+也就是说：
+
+- 全局阶段最多大约只能用 40 次仿真；
+- 局部阶段至少会被留出大约 20 次仿真空间。
+
+如果你是 4 参数对称版，那么维度是 4：
+
+- `参数维度 * 4 = 16`
+- `max(8, 16) = 16`
+- `max_evaluations // 3 = 20`
+- 所以 `reserved_local_budget = 16`
+- 于是 `global_budget_limit = 44`
+
+### 为什么 `global.maxiter` 不是“全局会跑多少次仿真”
+
+因为你现在用的是 `scipy.optimize.differential_evolution`。它每一代不是只评估 1 次，而是要评估一整个人群。
+
+粗略地说，全局阶段的函数评估次数大约是：
+
+```text
+global_evals ≈ population_size * (1 + global.maxiter)
+```
+
+而这里：
+
+```text
+population_size ≈ popsize * 参数维度
+```
+
+所以在你的项目里：
+
+- 如果是 8 维 direct
+- `global.popsize: 4`
+
+那么一代的人群大约就是：
+
+```text
+4 * 8 = 32
+```
+
+如果：
+
+```yaml
+global:
+  maxiter: 2
+  popsize: 4
+```
+
+那么全局阶段大致就会想要：
+
+```text
+32 * (1 + 2) = 96 次评估
+```
+
+但如果你的 `global_budget_limit` 只有 40，那么它根本跑不满 2 代，就会被预算提前截断。
+
+这也是为什么有时候你感觉：
+
+- 明明写了很大的 `global.maxiter`
+- 结果全局阶段却很快停了
+
+原因通常不是 `maxiter` 没生效，而是预算先到了。
+
+### 为什么 `local.maxiter` 也不是“局部会跑多少次仿真”
+
+因为 `Powell` 每一轮迭代内部也可能调用很多次目标函数。
+
+所以：
+
+- `local.maxiter` 是“最多做多少轮 Powell 迭代”
+- `local.maxfev` 才更接近“最多做多少次局部仿真”
+
+如果你没有显式写 `local.maxfev`，当前实现会自动把它设成“局部阶段剩余预算”。
+
+所以局部阶段真实会停下来的原因通常是：
+
+- 先碰到剩余预算；
+- 或者先碰到你显式写的 `local.maxfev`；
+- 最后才是 `local.maxiter`。
+
+### 一个最实用的经验公式
+
+如果你只是想“先大概配得合理一点”，可以这样想：
+
+1. 先定 `max_evaluations`
+   - 这是你愿意付出的总仿真成本。
+2. 再看参数维度
+   - 8 维 direct 会比 4 维 grouped 贵很多。
+3. 再用 `global.popsize * 参数维度 * (1 + global.maxiter)` 估算全局想吃掉多少预算。
+4. 确保这个值不要明显大于 `global_budget_limit`。
+5. 再确认局部阶段至少还剩 `10~30` 次评估空间。
+
+### 结合你现在的 RAMZI，给几个实用配置
+
+#### 低成本试跑
+
+适合先看趋势，不追求最后结果：
+
+```yaml
+optimization:
+  max_evaluations: 30
+  strategy:
+    global:
+      maxiter: 1
+      popsize: 3
+    local:
+      maxiter: 10
+```
+
+如果是 8 维 direct：
+
+- 人群大约 `3 * 8 = 24`
+- 全局想要大约 `24 * (1 + 1) = 48` 次
+- 但预算只有 30，所以全局会被明显截断
+
+这类配置的意义主要是“摸地形”。
+
+#### 中等预算
+
+更适合认真找一个可用初解：
+
+```yaml
+optimization:
+  max_evaluations: 60
+  strategy:
+    global:
+      maxiter: 1
+      popsize: 4
+    local:
+      maxiter: 20
+```
+
+如果是 8 维 direct：
+
+- 全局人群大约 `32`
+- 全局想要大约 `64` 次
+- 但当前实现只会给全局大约 `40` 次
+
+所以这时全局通常只能跑一部分，然后把剩余预算留给局部精修。
+
+#### 你容易踩坑的一种配置
+
+```yaml
+optimization:
+  max_evaluations: 60
+  strategy:
+    global:
+      maxiter: 10
+      popsize: 8
+```
+
+如果是 8 维 direct：
+
+- 人群大约 `8 * 8 = 64`
+- 全局想要大约 `64 * 11 = 704` 次
+
+这和 `max_evaluations: 60` 完全不在一个量级上。结果通常就是：
+
+- 你以为会跑很多代；
+- 实际上很早就被预算截断；
+- 局部阶段也会很紧张。
+
+### 一句话总结
+
+可以把它记成：
+
+- `max_evaluations` 决定“这次总共花多少钱”
+- `global.maxiter + global.popsize` 决定“全局阶段有多贪”
+- `local.maxiter + local.maxfev` 决定“局部阶段能修多久”
+
+如果只想先避免配错，最稳妥的顺序是：
+
+1. 先定 `max_evaluations`
+2. 再把 `global.popsize` 设小
+3. 再把 `global.maxiter` 设成 `1` 或 `2`
+4. 最后给局部阶段留够预算
 
 #### `optimization.logging`
 
