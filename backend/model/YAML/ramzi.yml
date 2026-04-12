@@ -54,9 +54,9 @@ parameters:
       - 3.141592653589793
   constraints:
   - name: balanced_ring_bias
-    lhs: fait + faib
+    lhs: fait
     operator: ==
-    rhs: 0.0
+    rhs: faib
   fixed:
     E1:
       real: 0.0
@@ -68,7 +68,7 @@ parameters:
     Ko: 0.5
     thetai: 1.5707963267948966
     thetao: 1.5707963267948966
-    faib: -1.5550883635269477
+    faib: 1.5550883635269477
     fait: 1.5550883635269477
     Alfadb: 15.0
     ng: 4.3
@@ -80,11 +80,11 @@ parameters:
 calibration:
   zero_config:
     tunable:
-      fai1: -0.147026536188
-      fai2: -2.14947769359
-      fai3: -0.162734499456
-      fai4: -1.94715912669
-      theta1: -1.95407063053
-      theta2: -2.29336263712
-      theta3: -1.95407063053
-      theta4: -2.29336263712
+      fai1: 0.001
+      fai2: 0.001
+      fai3: 0.001
+      fai4: 0.001
+      theta1: 3.14159
+      theta2: 3.14159
+      theta3: 3.14159
+      theta4: 3.14159
