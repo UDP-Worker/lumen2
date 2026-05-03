@@ -44,13 +44,13 @@ def configure_channel_limits(
     imax: float | Sequence[float] | None = None,
     engine: Any | None = None,
     com_port: int | None = None,
-) -> None:
+) -> Any:
     with _voltage_source_context(engine, com_port=com_port) as matlab_engine:
-        matlab_engine.silicon_extreme_api(
+        return matlab_engine.silicon_extreme_api(
             "configure_limits",
             to_matlab_row_vector(channels),
             _to_matlab_scalar_or_vector(vmax),
-            _to_matlab_scalar_or_vector(imax),
+            _amps_to_device_milliamps(imax),
             nargout=1,
         )
 
@@ -110,7 +110,7 @@ def apply_channel_voltages(
             "Vmax",
             _to_matlab_scalar_or_vector(vmax),
             "Imax",
-            _to_matlab_scalar_or_vector(imax),
+            _amps_to_device_milliamps(imax),
             "settle_time_s",
             float(settle_time_s),
             "disconnect_when_done",
@@ -230,6 +230,19 @@ def _to_matlab_scalar_or_vector(value: float | Sequence[float] | None) -> Any:
         return float(value)
     except (TypeError, ValueError):
         return to_matlab_row_vector([float(item) for item in value])
+
+
+def _amps_to_device_milliamps(value: float | Sequence[float] | None) -> Any:
+    if value is None:
+        return to_matlab_row_vector(())
+
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError("Numeric limit values cannot be strings or bytes.")
+
+    try:
+        return float(value) * 1000.0
+    except (TypeError, ValueError):
+        return to_matlab_row_vector([float(item) * 1000.0 for item in value])
 
 
 def _snapshot_result_to_dict(result: Any) -> dict[int, dict[str, float]]:

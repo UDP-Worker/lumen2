@@ -5,8 +5,8 @@ model:
   matlab_dir: backend/model/MATLAB
 simulation:
   wavelength_nm:
-    start: 1549.923
-    stop: 1550.2032
+    start: 1530.0000
+    stop: 1610.0000
     step: 0.0002
 outputs:
   observe_port: C1
@@ -103,7 +103,7 @@ calibration:
     voltage_source:
         com_port: 7
         vmax: 12.0
-        imax: 0.02
+        imax: 0.02  # A; SiliconExtreme receives this as 20 mA
 
 optimization:
   target:

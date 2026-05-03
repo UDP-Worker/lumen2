@@ -109,6 +109,22 @@ classdef SiliconExtreme < handle
                 'set IMAX');
         end
 
+        function IsSuccess = setCurrentLimit(obj, channel, Imax)
+            validateattributes(Imax, {'numeric'}, {'scalar', 'finite'});
+
+            try
+                IsSuccess = obj.setImax(channel, Imax);
+            catch imaxError
+                try
+                    IsSuccess = obj.setI(channel, Imax);
+                catch currentError
+                    error('SiliconExtreme:CurrentLimitFailed', ...
+                        'Failed to set current limit on channel %d with both IMAX and I commands. IMAX error: %s I error: %s', ...
+                        obj.validateChannel(channel), imaxError.message, currentError.message);
+                end
+            end
+        end
+
         function IsSuccess = setVmax_all(obj, Vmax)
             validateattributes(Vmax, {'numeric'}, {'scalar', 'finite'});
             IsSuccess = obj.expectOk(sprintf('VMAXALL=%.4f', Vmax), 'set VMAXALL');
@@ -124,7 +140,13 @@ classdef SiliconExtreme < handle
             voltages = obj.validateNumericVector(voltages, numel(channels), 'voltages');
 
             for idx = 1:numel(channels)
-                obj.setV(channels(idx), voltages(idx));
+                try
+                    obj.setV(channels(idx), voltages(idx));
+                catch setVoltageError
+                    error('SiliconExtreme:SetVoltageFailed', ...
+                        'Failed to set channel %d voltage to %.4f. %s', ...
+                        channels(idx), voltages(idx), setVoltageError.message);
+                end
             end
         end
 
@@ -141,7 +163,7 @@ classdef SiliconExtreme < handle
 
             if ~isempty(imaxValues)
                 for idx = 1:numel(channels)
-                    obj.setImax(channels(idx), imaxValues(idx));
+                    obj.setCurrentLimit(channels(idx), imaxValues(idx));
                 end
             end
         end

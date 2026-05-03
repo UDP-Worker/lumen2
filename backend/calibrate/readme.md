@@ -151,8 +151,8 @@ calibration:
     calibration_offsets: [-0.4, -0.2, 0.0, 0.2, 0.4]
     voltage_source:
       com_port: 3
-      vmax: 6.0
-      imax: 0.02
+      vmax: 6.0   # V
+      imax: 0.02  # A; SiliconExtreme receives this as 20 mA
 ```
 
 也可以通过 CLI 覆盖其中一部分参数。
@@ -168,7 +168,7 @@ python -m backend.calibrate.calibrate_control backend/model/YAML/ramzi.yml
 - `--channels 1 2 3 4`
 - `--com-port 3`
 - `--vmax 6.0`
-- `--imax 0.02`
+- `--imax 0.02`，单位 A；SiliconExtreme 串口命令会自动转换为 mA
 - `--zero-voltages 1=0.0 2=0.0 3=0.0 4=0.0`
 - `--calibration-offsets -0.4 -0.2 0.0 0.2 0.4`
 - `--output-dir path/to/output`

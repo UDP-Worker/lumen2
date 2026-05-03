@@ -76,7 +76,7 @@ def run_control_calibration(
         zero_voltages=zero_voltages,
     )
     logger.info(
-        "Starting control curve capture: channels=%s, zero_voltages=%s, vmax=%.6f, imax=%.6f",
+        "Starting control curve capture: channels=%s, zero_voltages=%s, vmax=%.6f V, imax=%.6f A",
         settings.channels,
         settings.zero_voltages,
         settings.vmax,
@@ -89,13 +89,30 @@ def run_control_calibration(
 
     engine = connect_voltage_source(settings.com_port)
     try:
-        configure_channel_limits(
+        try:
+            configure_channel_limits(
+                settings.channels,
+                vmax=settings.vmax,
+                imax=settings.imax,
+                engine=engine,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to configure voltage source limits: channels=%s, vmax=%.6f V, imax=%.6f A",
+                settings.channels,
+                settings.vmax,
+                settings.imax,
+            )
+            raise
+        logger.info(
+            "Configured voltage source limits: channels=%s, vmax=%.6f V, imax=%.6f A (%.6f mA on SiliconExtreme)",
             settings.channels,
-            vmax=settings.vmax,
-            imax=settings.imax,
-            engine=engine,
+            settings.vmax,
+            settings.imax,
+            settings.imax * 1000.0,
         )
 
+        logger.info("Applying initial zero voltages: %s", current_voltages)
         _apply_voltages(current_voltages, engine=engine, settle_time_s=settings.settle_time_s)
 
         for channel in settings.channels:
