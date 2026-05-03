@@ -149,11 +149,17 @@ calibration:
       3: 0.0
       4: 0.0
     calibration_offsets: [-0.4, -0.2, 0.0, 0.2, 0.4]
+    calibration_offsets_by_channel:
+      3: [0.0, 0.2, 0.4, 0.6]
+      4: [0.0, 0.2, 0.4, 0.6]
     voltage_source:
       com_port: 3
       vmax: 6.0   # V
       imax: 0.02  # A; SiliconExtreme receives this as 20 mA
 ```
+
+`calibration_offsets` 是默认扫描偏移，实际施加电压为 `zero_voltage + offset`。
+如果某些通道需要不同扫描范围，可以在 `calibration_offsets_by_channel` 中覆盖该通道的偏移列表。
 
 也可以通过 CLI 覆盖其中一部分参数。
 
@@ -170,7 +176,7 @@ python -m backend.calibrate.calibrate_control backend/model/YAML/ramzi.yml
 - `--vmax 6.0`
 - `--imax 0.02`，单位 A；SiliconExtreme 串口命令会自动转换为 mA
 - `--zero-voltages 1=0.0 2=0.0 3=0.0 4=0.0`
-- `--calibration-offsets -0.4 -0.2 0.0 0.2 0.4`
+- `--calibration-offsets -0.4 -0.2 0.0 0.2 0.4`，CLI 会覆盖所有通道的扫描偏移
 - `--output-dir path/to/output`
 
 示例：
@@ -186,7 +192,8 @@ python -m backend.calibrate.calibrate_control backend/model/YAML/ramzi.yml --cha
 3. 连接电源并配置通道限制。
 4. 先把所有通道设置到零电压。
 5. 对每个通道单独扫描：
-   当前通道取 `zero_voltage + calibration_offsets`；
+   当前通道取 `zero_voltage + calibration_offsets_by_channel[channel]`；
+   如果该通道没有单独配置，则使用默认 `calibration_offsets`；
    其它通道始终保持在零电压。
 6. 每次改压后等待稳定，再读取整段 OSA 曲线。
 7. 把结果写入模型对应的数据目录。
@@ -203,6 +210,7 @@ python -m backend.calibrate.calibrate_control backend/model/YAML/ramzi.yml --cha
 ### 结果语义
 
 - `control_calibration.json` 中的 `results.<channel>.zero_voltage` 表示该通道的基准零电压。
+- `results.<channel>.calibration_offsets` 表示该通道本次使用的相对零电压扫描偏移。
 - `results.<channel>.sweep_values` 表示该通道本次实际施加的电压值。
 - `results.<channel>.curve_archive_prefix` 用于在 `control_calibration_curves.npz` 中定位这一组曲线。
 

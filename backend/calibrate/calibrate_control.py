@@ -41,6 +41,7 @@ class ControlCalibrationSettings:
     imax: float
     settle_time_s: float
     calibration_offsets: NDArray[np.float64]
+    calibration_offsets_by_channel: dict[int, NDArray[np.float64]]
     zero_voltages: dict[int, float]
     osa_settings: dict[str, Any]
 
@@ -116,7 +117,8 @@ def run_control_calibration(
         _apply_voltages(current_voltages, engine=engine, settle_time_s=settings.settle_time_s)
 
         for channel in settings.channels:
-            sweep_values = settings.zero_voltages[channel] + settings.calibration_offsets
+            channel_offsets = settings.calibration_offsets_by_channel[channel]
+            sweep_values = settings.zero_voltages[channel] + channel_offsets
             _validate_voltage_sweep(
                 channel,
                 sweep_values,
@@ -124,10 +126,12 @@ def run_control_calibration(
                 vmax=settings.vmax,
             )
             logger.info(
-                "Capturing channel %d around zero voltage %.6f with %d sweep samples.",
+                "Capturing channel %d around zero voltage %.6f with %d sweep samples from %.6f V to %.6f V.",
                 channel,
                 settings.zero_voltages[channel],
                 len(sweep_values),
+                float(np.min(sweep_values)),
+                float(np.max(sweep_values)),
             )
             bundle = _capture_spectrum_bundle(
                 channel,
@@ -147,6 +151,7 @@ def run_control_calibration(
             )
             calibration_results[str(channel)] = {
                 "zero_voltage": float(settings.zero_voltages[channel]),
+                "calibration_offsets": [float(value) for value in channel_offsets],
                 "curve_archive_prefix": sanitize_key(bundle.name),
                 "sweep_values": [float(value) for value in bundle.sweep_values],
                 "curve_count": int(bundle.sweep_values.size),
@@ -170,6 +175,10 @@ def run_control_calibration(
             "imax": settings.imax,
             "settle_time_s": settings.settle_time_s,
             "calibration_offsets": [float(value) for value in settings.calibration_offsets],
+            "calibration_offsets_by_channel": {
+                str(channel): [float(value) for value in offsets]
+                for channel, offsets in settings.calibration_offsets_by_channel.items()
+            },
             "zero_voltages": {str(key): float(value) for key, value in settings.zero_voltages.items()},
             "osa_settings": settings.osa_settings,
         },
@@ -248,18 +257,23 @@ def _resolve_settings(
     osa_section.setdefault("plot_result", False)
     osa_section.setdefault("record", False)
 
-    resolved_offsets = np.asarray(
-        calibration_offsets
-        if calibration_offsets is not None
-        else get_sequence(
-            control_section,
-            "calibration_offsets",
-            default=(-0.4, -0.2, 0.0, 0.2, 0.4),
-        ),
-        dtype=float,
+    resolved_offsets = _resolve_calibration_offsets(
+        control_section,
+        calibration_offsets=calibration_offsets,
     )
-    if resolved_offsets.ndim != 1 or resolved_offsets.size < 2:
-        raise ValueError("Control calibration requires at least two calibration offsets.")
+    resolved_offsets_by_channel = _resolve_channel_calibration_offsets(
+        control_section,
+        resolved_channels,
+        default_offsets=resolved_offsets,
+        cli_offsets_provided=calibration_offsets is not None,
+    )
+    for channel, offsets in resolved_offsets_by_channel.items():
+        _validate_voltage_sweep(
+            channel,
+            resolved_zero_voltages[channel] + offsets,
+            zero_voltage=resolved_zero_voltages[channel],
+            vmax=float(resolved_vmax_raw),
+        )
 
     return ControlCalibrationSettings(
         channels=resolved_channels,
@@ -268,6 +282,7 @@ def _resolve_settings(
         imax=float(resolved_imax_raw),
         settle_time_s=float(settle_time_s if settle_time_s is not None else control_section.get("settle_time_s", 0.5)),
         calibration_offsets=resolved_offsets,
+        calibration_offsets_by_channel=resolved_offsets_by_channel,
         zero_voltages=resolved_zero_voltages,
         osa_settings=osa_section,
     )
@@ -287,6 +302,64 @@ def _resolve_zero_voltage_mapping(control_section: Mapping[str, Any]) -> dict[in
     for key, value in raw_mapping.items():
         resolved[int(key)] = float(value)
     return resolved
+
+
+def _resolve_calibration_offsets(
+    control_section: Mapping[str, Any],
+    *,
+    calibration_offsets: Sequence[float] | None,
+) -> NDArray[np.float64]:
+    raw_offsets = (
+        calibration_offsets
+        if calibration_offsets is not None
+        else get_sequence(
+            control_section,
+            "calibration_offsets",
+            default=(-0.4, -0.2, 0.0, 0.2, 0.4),
+        )
+    )
+    return _normalize_calibration_offsets(raw_offsets, label="calibration_offsets")
+
+
+def _resolve_channel_calibration_offsets(
+    control_section: Mapping[str, Any],
+    channels: Sequence[int],
+    *,
+    default_offsets: NDArray[np.float64],
+    cli_offsets_provided: bool,
+) -> dict[int, NDArray[np.float64]]:
+    offsets_by_channel = {int(channel): default_offsets.copy() for channel in channels}
+    if cli_offsets_provided:
+        return offsets_by_channel
+
+    raw_mapping = control_section.get("calibration_offsets_by_channel")
+    if raw_mapping is None:
+        return offsets_by_channel
+    if not isinstance(raw_mapping, Mapping):
+        raise ValueError("calibration.control.calibration_offsets_by_channel must be a channel-to-offset-list mapping.")
+
+    for raw_channel, raw_offsets in raw_mapping.items():
+        channel = int(raw_channel)
+        if channel not in offsets_by_channel:
+            raise ValueError(
+                "calibration.control.calibration_offsets_by_channel contains channel "
+                f"{channel}, which is not listed in calibration.control.channels."
+            )
+        offsets_by_channel[channel] = _normalize_calibration_offsets(
+            raw_offsets,
+            label=f"calibration_offsets_by_channel.{channel}",
+        )
+
+    return offsets_by_channel
+
+
+def _normalize_calibration_offsets(values: Sequence[float], *, label: str) -> NDArray[np.float64]:
+    offsets = np.asarray(values, dtype=float)
+    if offsets.ndim != 1 or offsets.size < 2:
+        raise ValueError(f"Control calibration requires at least two values for {label}.")
+    if not np.all(np.isfinite(offsets)):
+        raise ValueError(f"{label} must contain only finite numeric values.")
+    return offsets
 
 
 def _build_control_calibration_logger(model_name: str, destination_dir: Path) -> logging.Logger:
