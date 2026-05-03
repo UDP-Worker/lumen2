@@ -5,8 +5,8 @@ model:
   matlab_dir: backend/model/MATLAB
 simulation:
   wavelength_nm:
-    start: 1530.0000
-    stop: 1600.0000
+    start: 1554.0000
+    stop: 1555.0000
     step: 0.0002
 outputs:
   observe_port: C1
@@ -127,6 +127,16 @@ calibration:
       keep_open: true
       plot_result: false
       record: false
+  voltage_to_tunable:
+    channel_to_parameter:
+      3: theta3
+      4: theta1
+      5: fai3
+      6: fai4
+      7: theta4
+      8: theta2
+      9: fai2
+      10: fai1
 optimization:
   target:
     center_nm: 1550.0
