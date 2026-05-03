@@ -160,6 +160,12 @@ calibration:
     voltage_verify_max_attempts: 5
     voltage_verify_retry_delay_s: 0.5
     voltage_verify_abort_on_failure: false
+    osa:
+      reflevel_up_dbm: -50.0
+      reflevel_down_dbm: -70.0
+      scale_db_per_div: 2.0
+      restore_defaults: false
+      keep_open: true
 ```
 
 `calibration_offsets` 是默认扫描偏移，实际施加电压为 `zero_voltage + offset`。
@@ -167,6 +173,8 @@ calibration:
 `voltage_verify_tolerance` 控制电压源读回值和目标值的允许误差。
 如果读回值超界，程序会等待 `voltage_verify_retry_delay_s` 后重发目标电压，最多尝试 `voltage_verify_max_attempts` 次。
 `voltage_verify_abort_on_failure: false` 时，即使最终仍超界也只写入警告并继续扫描；设为 `true` 时会中止扫描。
+控制侧标定默认让 OSA `keep_open: true` 且 `restore_defaults: false`，避免每个电压点都关闭 GPIB 对象并恢复仪器默认设置。
+`reflevel_up_dbm` 控制 OSA 显示顶部参考电平，`scale_db_per_div` 控制垂直方向每格 dB 数；例如 `reflevel_up_dbm: -50.0` 和 `scale_db_per_div: 2.0` 表示顶部为 -50 dBm、每格 2 dB。
 
 也可以通过 CLI 覆盖其中一部分参数。
 

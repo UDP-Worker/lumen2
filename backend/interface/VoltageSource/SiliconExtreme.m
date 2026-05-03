@@ -178,12 +178,7 @@ classdef SiliconExtreme < handle
             for idx = 1:numel(channels)
                 voltages(idx) = obj.getV(channels(idx));
                 currents(idx) = obj.getI(channels(idx));
-                try
-                    powers(idx) = obj.getP(channels(idx));
-                catch
-                    % Some firmware revisions do not implement per-channel power reads.
-                    powers(idx) = NaN;
-                end
+                powers(idx) = NaN;
             end
 
             snapshot = struct( ...

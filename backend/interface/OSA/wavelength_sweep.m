@@ -12,6 +12,7 @@ function result = wavelength_sweep(varargin)
 %       speed                         char/string, default '2x'
 %       reflevel_up_dbm               double scalar, default 0
 %       reflevel_down_dbm             double scalar, default -100
+%       scale_db_per_div              positive double scalar, default []
 %       channel                       char/string, default 'a'
 %       board_index                   integer scalar, default 0
 %       primary_address               integer scalar, default 1
@@ -20,6 +21,7 @@ function result = wavelength_sweep(varargin)
 %       output_buffer_size            integer scalar, default 540027
 %       use_requested_range           logical/numeric scalar, default true
 %       restore_defaults              logical/numeric scalar, default true
+%       keep_open                     logical/numeric scalar, default false
 %       record                        logical/numeric scalar, default false
 %       save_path                     char/string, default ''
 %       plot_result                   logical/numeric scalar, default nargout == 0
@@ -48,6 +50,7 @@ function result = wavelength_sweep(varargin)
     addParameter(parser, 'speed', '2x', @localTextScalar);
     addParameter(parser, 'reflevel_up_dbm', 0, @localNumericScalar);
     addParameter(parser, 'reflevel_down_dbm', -100, @localNumericScalar);
+    addParameter(parser, 'scale_db_per_div', [], @localOptionalPositiveScalar);
     addParameter(parser, 'channel', 'a', @localTextScalar);
     addParameter(parser, 'board_index', 0, @localNonNegativeIntegerScalar);
     addParameter(parser, 'primary_address', 1, @localPositiveIntegerScalar);
@@ -56,6 +59,7 @@ function result = wavelength_sweep(varargin)
     addParameter(parser, 'output_buffer_size', 180009 * 3, @localPositiveIntegerScalar);
     addParameter(parser, 'use_requested_range', true, @localLogicalScalar);
     addParameter(parser, 'restore_defaults', true, @localLogicalScalar);
+    addParameter(parser, 'keep_open', false, @localLogicalScalar);
     addParameter(parser, 'record', false, @localLogicalScalar);
     addParameter(parser, 'save_path', '', @localTextScalar);
     addParameter(parser, 'plot_result', nargout == 0, @localLogicalScalar);
@@ -83,13 +87,20 @@ function result = wavelength_sweep(varargin)
         * settings.points_per_resolution / settings.resolution_nm) + 1;
 
     osa = localGetGpibObject(settings.board_index, settings.primary_address);
-    cleanup = onCleanup(@() localCleanupOsa(osa, settings)); %#ok<NASGU>
+    cleanup = onCleanup(@() localCleanupOsa(osa, settings));
 
-    set(osa, 'InputBufferSize', settings.input_buffer_size);
-    set(osa, 'OutputBufferSize', settings.output_buffer_size);
-    set(osa, 'Timeout', settings.timeout_s);
+    if strcmpi(osa.Status, 'open')
+        try
+            set(osa, 'Timeout', settings.timeout_s);
+        catch
+        end
+    else
+        set(osa, 'InputBufferSize', settings.input_buffer_size);
+        set(osa, 'OutputBufferSize', settings.output_buffer_size);
+        set(osa, 'Timeout', settings.timeout_s);
+        fopen(osa);
+    end
 
-    fopen(osa);
     localConfigureSweep(osa, settings);
     localWaitForSweep(osa, settings.timeout_s);
 
@@ -185,16 +196,15 @@ function osa = localGetGpibObject(boardIndex, primaryAddress)
     end
 
     osa = existing(1);
-    try
-        fclose(osa);
-    catch
-    end
 end
 
 function localConfigureSweep(osa, settings)
     fprintf(osa, [':sens:wav:star ', num2str(settings.lam_start_nm), 'nm']);
     fprintf(osa, [':sens:wav:stop ', num2str(settings.lam_stop_nm), 'nm']);
     fprintf(osa, [':disp:trace:y1:rlev ', num2str(settings.reflevel_up_dbm), 'dbm']);
+    if ~isempty(settings.scale_db_per_div)
+        fprintf(osa, [':disp:trace:y1:pdiv ', num2str(settings.scale_db_per_div), 'db']);
+    end
     fprintf(osa, [':sens:swe:points ', num2str(settings.point_count)]);
     fprintf(osa, [':sens:band:res ', num2str(settings.resolution_nm), 'nm']);
     fprintf(osa, [':sens:sens ', settings.sensitivity]);
@@ -235,6 +245,10 @@ function localCleanupOsa(osa, settings)
         return;
     end
 
+    if settings.keep_open
+        return;
+    end
+
     if settings.restore_defaults
         try
             localRestoreDefaults(osa, settings);
@@ -269,6 +283,7 @@ function localRestoreDefaults(osa, settings)
     end
 
     fprintf(osa, ':disp:trace:y1:rlev -10dbm');
+    fprintf(osa, ':disp:trace:y1:pdiv 10db');
     fprintf(osa, ':sens:band:res 0.1nm');
     fprintf(osa, ':sens:sens normal');
     fprintf(osa, ':sens:swe:points:auto on');
@@ -284,6 +299,10 @@ end
 
 function tf = localPositiveScalar(value)
     tf = localNumericScalar(value) && double(value) > 0;
+end
+
+function tf = localOptionalPositiveScalar(value)
+    tf = isempty(value) || localPositiveScalar(value);
 end
 
 function tf = localPositiveIntegerScalar(value)

@@ -291,6 +291,8 @@ def _resolve_settings(
     osa_section.setdefault("timeout_s", 150.0)
     osa_section.setdefault("plot_result", False)
     osa_section.setdefault("record", False)
+    osa_section.setdefault("restore_defaults", False)
+    osa_section.setdefault("keep_open", True)
 
     resolved_offsets = _resolve_calibration_offsets(
         control_section,
@@ -454,6 +456,7 @@ def _capture_spectrum_bundle(
             voltages=trial,
             phase="set",
         )
+        voltage_start = time.monotonic()
         snapshot = _apply_voltages(
             trial,
             engine=engine,
@@ -465,11 +468,13 @@ def _capture_spectrum_bundle(
             logger=logger,
             progress=progress,
         )
+        voltage_elapsed_s = time.monotonic() - voltage_start
         logger.info(
-            "Applied voltages for channel %d sample %d/%d: requested=%s measured=%s",
+            "Applied voltages for channel %d sample %d/%d in %.3f s: requested=%s measured=%s",
             channel,
             index,
             sweep_count,
+            voltage_elapsed_s,
             _format_voltage_map(trial),
             _format_snapshot(snapshot),
         )
@@ -482,8 +487,17 @@ def _capture_spectrum_bundle(
             voltages=trial,
             phase="osa",
         )
+        osa_start = time.monotonic()
         with progress.external_output():
             spectrum = read_spectrum(engine=engine, **osa_settings)
+        osa_elapsed_s = time.monotonic() - osa_start
+        logger.info(
+            "Captured OSA spectrum for channel %d sample %d/%d in %.3f s.",
+            channel,
+            index,
+            sweep_count,
+            osa_elapsed_s,
+        )
         current_wavelength = np.asarray(spectrum.wavelength_nm, dtype=float)
         current_power = np.asarray(spectrum.power_dbm, dtype=float)
 

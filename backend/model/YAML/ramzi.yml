@@ -114,12 +114,17 @@ calibration:
     voltage_verify_retry_delay_s: 0.5
     voltage_verify_abort_on_failure: false
     osa:
-      lam_start_nm: 1530
-      lam_stop_nm: 1600
-      resolution_nm: 0.5
+      lam_start_nm: 1554
+      lam_stop_nm: 1555
+      resolution_nm: 0.02
       points_per_resolution: 5
       speed: 2x
+      reflevel_up_dbm: -50.0
+      reflevel_down_dbm: -70.0
+      scale_db_per_div: 2.0
       timeout_s: 150.0
+      restore_defaults: false
+      keep_open: true
       plot_result: false
       record: false
 optimization:

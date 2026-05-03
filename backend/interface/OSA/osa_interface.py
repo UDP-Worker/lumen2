@@ -41,12 +41,14 @@ def read_spectrum(
     speed: str = "2x",
     reflevel_up_dbm: float = 0.0,
     reflevel_down_dbm: float = -100.0,
+    scale_db_per_div: float | None = None,
     channel: str = "a",
     board_index: int = 0,
     primary_address: int = 1,
     timeout_s: float = 150.0,
     use_requested_range: bool = True,
     restore_defaults: bool = True,
+    keep_open: bool = False,
     record: bool = False,
     save_path: str | Path | None = None,
     plot_result: bool = False,
@@ -85,6 +87,8 @@ def read_spectrum(
         bool(use_requested_range),
         "restore_defaults",
         bool(restore_defaults),
+        "keep_open",
+        bool(keep_open),
         "record",
         bool(record),
         "plot_result",
@@ -94,6 +98,9 @@ def read_spectrum(
         "interpolation_method",
         str(interpolation_method),
     ]
+
+    if scale_db_per_div is not None:
+        args.extend(["scale_db_per_div", float(scale_db_per_div)])
 
     if save_path is not None:
         args.extend(["save_path", str(Path(save_path))])
