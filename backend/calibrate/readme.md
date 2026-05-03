@@ -156,10 +156,17 @@ calibration:
       com_port: 3
       vmax: 6.0   # V
       imax: 0.02  # A; SiliconExtreme receives this as 20 mA
+    voltage_verify_tolerance: 0.10  # V
+    voltage_verify_max_attempts: 5
+    voltage_verify_retry_delay_s: 0.5
+    voltage_verify_abort_on_failure: false
 ```
 
 `calibration_offsets` 是默认扫描偏移，实际施加电压为 `zero_voltage + offset`。
 如果某些通道需要不同扫描范围，可以在 `calibration_offsets_by_channel` 中覆盖该通道的偏移列表。
+`voltage_verify_tolerance` 控制电压源读回值和目标值的允许误差。
+如果读回值超界，程序会等待 `voltage_verify_retry_delay_s` 后重发目标电压，最多尝试 `voltage_verify_max_attempts` 次。
+`voltage_verify_abort_on_failure: false` 时，即使最终仍超界也只写入警告并继续扫描；设为 `true` 时会中止扫描。
 
 也可以通过 CLI 覆盖其中一部分参数。
 
@@ -195,7 +202,7 @@ python -m backend.calibrate.calibrate_control backend/model/YAML/ramzi.yml --cha
    当前通道取 `zero_voltage + calibration_offsets_by_channel[channel]`；
    如果该通道没有单独配置，则使用默认 `calibration_offsets`；
    其它通道始终保持在零电压。
-6. 每次改压后等待稳定，再读取整段 OSA 曲线。
+6. 每次改压后先读取电压源 snapshot，确认实际电压和目标值一致，再等待稳定并读取整段 OSA 曲线。
 7. 把结果写入模型对应的数据目录。
 
 ### 输出结果

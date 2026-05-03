@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
+from tqdm.auto import tqdm
 
 from backend.calibrate._shared import (
     CurveSweepBundle,
@@ -40,6 +42,10 @@ class ControlCalibrationSettings:
     vmax: float
     imax: float
     settle_time_s: float
+    voltage_verify_tolerance: float
+    voltage_verify_max_attempts: int
+    voltage_verify_retry_delay_s: float
+    voltage_verify_abort_on_failure: bool
     calibration_offsets: NDArray[np.float64]
     calibration_offsets_by_channel: dict[int, NDArray[np.float64]]
     zero_voltages: dict[int, float]
@@ -114,49 +120,74 @@ def run_control_calibration(
         )
 
         logger.info("Applying initial zero voltages: %s", current_voltages)
-        _apply_voltages(current_voltages, engine=engine, settle_time_s=settings.settle_time_s)
+        zero_snapshot = _apply_voltages(
+            current_voltages,
+            engine=engine,
+            settle_time_s=settings.settle_time_s,
+            voltage_tolerance=settings.voltage_verify_tolerance,
+            max_attempts=settings.voltage_verify_max_attempts,
+            retry_delay_s=settings.voltage_verify_retry_delay_s,
+            abort_on_failure=settings.voltage_verify_abort_on_failure,
+            logger=logger,
+        )
+        logger.info("Initial voltage source snapshot: %s", _format_snapshot(zero_snapshot))
 
-        for channel in settings.channels:
-            channel_offsets = settings.calibration_offsets_by_channel[channel]
-            sweep_values = settings.zero_voltages[channel] + channel_offsets
-            _validate_voltage_sweep(
-                channel,
-                sweep_values,
-                zero_voltage=settings.zero_voltages[channel],
-                vmax=settings.vmax,
-            )
-            logger.info(
-                "Capturing channel %d around zero voltage %.6f with %d sweep samples from %.6f V to %.6f V.",
-                channel,
-                settings.zero_voltages[channel],
-                len(sweep_values),
-                float(np.min(sweep_values)),
-                float(np.max(sweep_values)),
-            )
-            bundle = _capture_spectrum_bundle(
-                channel,
-                sweep_values,
-                current_voltages,
-                osa_settings=settings.osa_settings,
-                settle_time_s=settings.settle_time_s,
-                engine=engine,
-            )
-            calibration_bundles.append(bundle)
-            logger.info(
-                "Captured %d curves for channel %d over sweep range %.6f -> %.6f.",
-                len(bundle.sweep_values),
-                channel,
-                float(np.min(bundle.sweep_values)),
-                float(np.max(bundle.sweep_values)),
-            )
-            calibration_results[str(channel)] = {
-                "zero_voltage": float(settings.zero_voltages[channel]),
-                "calibration_offsets": [float(value) for value in channel_offsets],
-                "curve_archive_prefix": sanitize_key(bundle.name),
-                "sweep_values": [float(value) for value in bundle.sweep_values],
-                "curve_count": int(bundle.sweep_values.size),
-                "curve_summary": summarize_curve_bundle(bundle),
-            }
+        total_points = sum(len(settings.calibration_offsets_by_channel[channel]) for channel in settings.channels)
+        progress = _ProgressReporter(total_points)
+        completed_points = 0
+        try:
+            for channel in settings.channels:
+                channel_offsets = settings.calibration_offsets_by_channel[channel]
+                sweep_values = settings.zero_voltages[channel] + channel_offsets
+                _validate_voltage_sweep(
+                    channel,
+                    sweep_values,
+                    zero_voltage=settings.zero_voltages[channel],
+                    vmax=settings.vmax,
+                )
+                logger.info(
+                    "Capturing channel %d around zero voltage %.6f with %d sweep samples from %.6f V to %.6f V.",
+                    channel,
+                    settings.zero_voltages[channel],
+                    len(sweep_values),
+                    float(np.min(sweep_values)),
+                    float(np.max(sweep_values)),
+                )
+                bundle = _capture_spectrum_bundle(
+                    channel,
+                    sweep_values,
+                    current_voltages,
+                    osa_settings=settings.osa_settings,
+                    settle_time_s=settings.settle_time_s,
+                    voltage_tolerance=settings.voltage_verify_tolerance,
+                    max_attempts=settings.voltage_verify_max_attempts,
+                    retry_delay_s=settings.voltage_verify_retry_delay_s,
+                    abort_on_failure=settings.voltage_verify_abort_on_failure,
+                    engine=engine,
+                    logger=logger,
+                    progress=progress,
+                    completed_points=completed_points,
+                    total_points=total_points,
+                )
+                completed_points += len(sweep_values)
+                calibration_bundles.append(bundle)
+                logger.info(
+                    "Captured %d curves for channel %d over sweep range %.6f -> %.6f.",
+                    len(bundle.sweep_values),
+                    channel,
+                    float(np.min(bundle.sweep_values)),
+                    float(np.max(bundle.sweep_values)),
+                )
+                calibration_results[str(channel)] = {
+                    "zero_voltage": float(settings.zero_voltages[channel]),
+                    "calibration_offsets": [float(value) for value in channel_offsets],
+                    "curve_archive_prefix": sanitize_key(bundle.name),
+                    "sweep_values": [float(value) for value in bundle.sweep_values],
+                    "curve_count": int(bundle.sweep_values.size),
+                    "curve_summary": summarize_curve_bundle(bundle),
+                }
+        finally:
+            progress.finish()
     finally:
         disconnect_voltage_source(engine, stop_engine=True)
 
@@ -174,6 +205,10 @@ def run_control_calibration(
             "vmax": settings.vmax,
             "imax": settings.imax,
             "settle_time_s": settings.settle_time_s,
+            "voltage_verify_tolerance": settings.voltage_verify_tolerance,
+            "voltage_verify_max_attempts": settings.voltage_verify_max_attempts,
+            "voltage_verify_retry_delay_s": settings.voltage_verify_retry_delay_s,
+            "voltage_verify_abort_on_failure": settings.voltage_verify_abort_on_failure,
             "calibration_offsets": [float(value) for value in settings.calibration_offsets],
             "calibration_offsets_by_channel": {
                 str(channel): [float(value) for value in offsets]
@@ -281,6 +316,10 @@ def _resolve_settings(
         vmax=float(resolved_vmax_raw),
         imax=float(resolved_imax_raw),
         settle_time_s=float(settle_time_s if settle_time_s is not None else control_section.get("settle_time_s", 0.5)),
+        voltage_verify_tolerance=float(control_section.get("voltage_verify_tolerance", 0.1)),
+        voltage_verify_max_attempts=max(int(control_section.get("voltage_verify_max_attempts", 5)), 1),
+        voltage_verify_retry_delay_s=float(control_section.get("voltage_verify_retry_delay_s", 0.5)),
+        voltage_verify_abort_on_failure=bool(control_section.get("voltage_verify_abort_on_failure", False)),
         calibration_offsets=resolved_offsets,
         calibration_offsets_by_channel=resolved_offsets_by_channel,
         zero_voltages=resolved_zero_voltages,
@@ -389,16 +428,62 @@ def _capture_spectrum_bundle(
     *,
     osa_settings: Mapping[str, Any],
     settle_time_s: float,
+    voltage_tolerance: float,
+    max_attempts: int,
+    retry_delay_s: float,
+    abort_on_failure: bool,
     engine: Any,
+    logger: logging.Logger,
+    progress: _ProgressReporter,
+    completed_points: int,
+    total_points: int,
 ) -> CurveSweepBundle:
     power_rows: list[NDArray[np.float64]] = []
     wavelength_nm: NDArray[np.float64] | None = None
 
-    for value in sweep_values:
+    sweep_count = len(sweep_values)
+    for index, value in enumerate(sweep_values, start=1):
         trial = dict(base_voltages)
         trial[channel] = float(value)
-        _apply_voltages(trial, engine=engine, settle_time_s=settle_time_s)
-        spectrum = read_spectrum(engine=engine, **osa_settings)
+        progress.update(
+            completed_points + index - 1,
+            total_points,
+            channel=channel,
+            channel_index=index,
+            channel_count=sweep_count,
+            voltages=trial,
+            phase="set",
+        )
+        snapshot = _apply_voltages(
+            trial,
+            engine=engine,
+            settle_time_s=settle_time_s,
+            voltage_tolerance=voltage_tolerance,
+            max_attempts=max_attempts,
+            retry_delay_s=retry_delay_s,
+            abort_on_failure=abort_on_failure,
+            logger=logger,
+            progress=progress,
+        )
+        logger.info(
+            "Applied voltages for channel %d sample %d/%d: requested=%s measured=%s",
+            channel,
+            index,
+            sweep_count,
+            _format_voltage_map(trial),
+            _format_snapshot(snapshot),
+        )
+        progress.update(
+            completed_points + index - 1,
+            total_points,
+            channel=channel,
+            channel_index=index,
+            channel_count=sweep_count,
+            voltages=trial,
+            phase="osa",
+        )
+        with progress.external_output():
+            spectrum = read_spectrum(engine=engine, **osa_settings)
         current_wavelength = np.asarray(spectrum.wavelength_nm, dtype=float)
         current_power = np.asarray(spectrum.power_dbm, dtype=float)
 
@@ -411,8 +496,27 @@ def _capture_spectrum_bundle(
             raise ValueError("OSA returned inconsistent wavelength grids during control calibration.")
 
         power_rows.append(current_power)
+        progress.update(
+            completed_points + index,
+            total_points,
+            channel=channel,
+            channel_index=index,
+            channel_count=sweep_count,
+            voltages=trial,
+            phase="done",
+        )
 
-    _apply_voltages(base_voltages, engine=engine, settle_time_s=settle_time_s)
+    _apply_voltages(
+        base_voltages,
+        engine=engine,
+        settle_time_s=settle_time_s,
+        voltage_tolerance=voltage_tolerance,
+        max_attempts=max_attempts,
+        retry_delay_s=retry_delay_s,
+        abort_on_failure=abort_on_failure,
+        logger=logger,
+        progress=progress,
+    )
 
     if wavelength_nm is None:
         raise RuntimeError(f"No spectra captured while sweeping channel {channel}.")
@@ -431,10 +535,153 @@ def _apply_voltages(
     *,
     engine: Any,
     settle_time_s: float,
-) -> None:
-    set_channel_voltages(channel_to_voltage, engine=engine)
+    voltage_tolerance: float,
+    max_attempts: int,
+    retry_delay_s: float,
+    abort_on_failure: bool,
+    logger: logging.Logger,
+    progress: _ProgressReporter | None = None,
+) -> dict[int, dict[str, float]]:
+    max_attempts = max(int(max_attempts), 1)
+    snapshot: dict[int, dict[str, float]] = {}
+    failures: list[str] = []
+
+    for attempt in range(1, max_attempts + 1):
+        context = progress.external_output() if progress is not None else _null_context()
+        with context:
+            snapshot = set_channel_voltages(channel_to_voltage, engine=engine)
+        failures = _find_voltage_snapshot_failures(
+            channel_to_voltage,
+            snapshot,
+            voltage_tolerance=voltage_tolerance,
+        )
+        if not failures:
+            if attempt > 1:
+                logger.info(
+                    "Voltage source reached requested values on attempt %d/%d: requested=%s measured=%s",
+                    attempt,
+                    max_attempts,
+                    _format_voltage_map(channel_to_voltage),
+                    _format_snapshot(snapshot),
+                )
+            break
+
+        message = (
+            f"Voltage source readback outside tolerance {voltage_tolerance:.4f} V "
+            f"on attempt {attempt}/{max_attempts}: "
+            + "; ".join(failures)
+        )
+        logger.warning("%s; full_snapshot=%s", message, _format_snapshot(snapshot))
+        if progress is not None:
+            progress.write(message)
+        if attempt < max_attempts:
+            time.sleep(max(float(retry_delay_s), 0.0))
+
+    if failures:
+        message = (
+            f"Voltage source did not settle within tolerance {voltage_tolerance:.4f} V after "
+            f"{max_attempts} attempts: "
+            + "; ".join(failures)
+        )
+        logger.error("%s; continuing=%s; full_snapshot=%s", message, not abort_on_failure, _format_snapshot(snapshot))
+        if progress is not None:
+            progress.write(message)
+        if abort_on_failure:
+            raise RuntimeError(message)
+
     if settle_time_s > 0:
         time.sleep(float(settle_time_s))
+    return snapshot
+
+
+def _find_voltage_snapshot_failures(
+    requested: Mapping[int, float],
+    snapshot: Mapping[int, Mapping[str, float]],
+    *,
+    voltage_tolerance: float,
+) -> list[str]:
+    failures: list[str] = []
+    for channel, target_voltage in requested.items():
+        measured = snapshot.get(int(channel))
+        if measured is None:
+            failures.append(f"ch{int(channel)} missing from voltage-source snapshot")
+            continue
+        measured_voltage = float(measured["voltage"])
+        error = measured_voltage - float(target_voltage)
+        if abs(error) > voltage_tolerance:
+            failures.append(
+                f"ch{int(channel)} requested {float(target_voltage):.4f} V, "
+                f"measured {measured_voltage:.4f} V, error {error:+.4f} V"
+            )
+
+    return failures
+
+
+class _ProgressReporter:
+    def __init__(self, total: int) -> None:
+        self.total = max(int(total), 1)
+        self.bar = tqdm(
+            total=self.total,
+            desc="control scan",
+            unit="pt",
+            dynamic_ncols=True,
+            leave=True,
+            mininterval=0.2,
+        )
+
+    def update(
+        self,
+        completed: int,
+        total: int,
+        *,
+        channel: int,
+        channel_index: int,
+        channel_count: int,
+        voltages: Mapping[int, float],
+        phase: str,
+    ) -> None:
+        total = max(int(total), 1)
+        completed = min(max(int(completed), 0), total)
+        self.bar.total = total
+        self.bar.n = completed
+        self.bar.set_postfix_str(
+            f"ch{channel} {channel_index}/{channel_count} {phase} | {_format_voltage_map(voltages, compact=True)}",
+            refresh=True,
+        )
+
+    def write(self, text: str) -> None:
+        self.bar.write(text)
+
+    @contextmanager
+    def external_output(self) -> Iterator[None]:
+        self.bar.clear()
+        try:
+            yield
+        finally:
+            self.bar.refresh()
+
+    def finish(self) -> None:
+        self.bar.close()
+
+
+@contextmanager
+def _null_context() -> Iterator[None]:
+    yield
+
+
+def _format_voltage_map(values: Mapping[int, float], *, compact: bool = False) -> str:
+    if compact:
+        return " ".join(f"{int(channel)}={float(voltage):.2f}" for channel, voltage in sorted(values.items()))
+    return " ".join(f"ch{int(channel)}={float(voltage):.3f}V" for channel, voltage in sorted(values.items()))
+
+
+def _format_snapshot(snapshot: Mapping[int, Mapping[str, float]]) -> str:
+    parts: list[str] = []
+    for channel, values in sorted(snapshot.items()):
+        voltage = float(values.get("voltage", np.nan))
+        current = float(values.get("current", np.nan))
+        parts.append(f"ch{int(channel)}={voltage:.4f}V/{current:.4f}mA")
+    return " ".join(parts)
 
 
 def _validate_voltage_sweep(
