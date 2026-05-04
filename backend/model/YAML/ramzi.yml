@@ -5,8 +5,8 @@ model:
   matlab_dir: backend/model/MATLAB
 simulation:
   wavelength_nm:
-    start: 1554.0000
-    stop: 1555.0000
+    start: 1594.5000
+    stop: 1595.5000
     step: 0.0002
 outputs:
   observe_port: C1
@@ -114,8 +114,8 @@ calibration:
     voltage_verify_retry_delay_s: 0.5
     voltage_verify_abort_on_failure: false
     osa:
-      lam_start_nm: 1554
-      lam_stop_nm: 1555
+      lam_start_nm: 1594.5
+      lam_stop_nm: 1595.5
       resolution_nm: 0.02
       points_per_resolution: 5
       speed: 2x
