@@ -369,12 +369,25 @@ def _fit_curve_pair(
         model_wavelength_nm,
         model_signal,
     )
+    if not np.all(np.isfinite(initial_model_segment)) or not np.all(np.isfinite(control_segment)):
+        return _invalid_fit_result(lower_bound, upper_bound)
+
     scale_initial, offset_initial = _fit_affine(initial_model_segment, control_segment)
+    if max_delta_nm > 0.0:
+        delta_eps = max(float(max_delta_nm) * 1e-9, 1e-12)
+        delta_initial = float(np.clip(delta_initial, -max_delta_nm + delta_eps, max_delta_nm - delta_eps))
+
+    initial_parameters = np.asarray([scale_initial, offset_initial, delta_initial], dtype=float)
+    if not np.all(np.isfinite(initial_parameters)):
+        return _invalid_fit_result(lower_bound, upper_bound)
+
     residual_scale = (
         float(fit_f_scale)
         if fit_f_scale is not None
         else max(float(np.ptp(control_segment)) * 0.05, 1e-6)
     )
+    if not np.isfinite(residual_scale) or residual_scale <= 0.0:
+        return _invalid_fit_result(lower_bound, upper_bound)
 
     def residual(parameters: NDArray[np.float64]) -> NDArray[np.float64]:
         scale, offset, delta = parameters
@@ -385,17 +398,28 @@ def _fit_curve_pair(
         )
         return control_segment - (float(scale) * shifted_model + float(offset))
 
-    result = least_squares(
-        residual,
-        x0=np.asarray([scale_initial, offset_initial, delta_initial], dtype=float),
-        bounds=(
-            np.asarray([0.0, -np.inf, -max_delta_nm], dtype=float),
-            np.asarray([np.inf, np.inf, max_delta_nm], dtype=float),
-        ),
-        method="trf",
-        loss=fit_loss,
-        f_scale=residual_scale,
-    )
+    try:
+        result = least_squares(
+            residual,
+            x0=initial_parameters,
+            bounds=(
+                np.asarray([0.0, -np.inf, -max_delta_nm], dtype=float),
+                np.asarray([np.inf, np.inf, max_delta_nm], dtype=float),
+            ),
+            method="trf",
+            loss=fit_loss,
+            f_scale=residual_scale,
+        )
+    except (FloatingPointError, RuntimeError, ValueError):
+        return _fit_curve_pair_by_shift_scan(
+            comparison_wavelength,
+            control_segment,
+            model_wavelength_nm,
+            model_signal,
+            max_delta_nm=max_delta_nm,
+            overlap_start_nm=lower_bound,
+            overlap_stop_nm=upper_bound,
+        )
 
     scale = float(result.x[0])
     offset = float(result.x[1])
@@ -411,6 +435,17 @@ def _fit_curve_pair(
     normalization = max(float(np.ptp(control_segment)), 1e-6)
     correlation = _pearson_correlation(control_segment, fitted_signal)
 
+    if not all(np.isfinite(value) for value in (scale, offset, delta, rmse, normalization, correlation)):
+        return _fit_curve_pair_by_shift_scan(
+            comparison_wavelength,
+            control_segment,
+            model_wavelength_nm,
+            model_signal,
+            max_delta_nm=max_delta_nm,
+            overlap_start_nm=lower_bound,
+            overlap_stop_nm=upper_bound,
+        )
+
     return {
         "valid": True,
         "fit_cost": rmse / normalization,
@@ -422,6 +457,59 @@ def _fit_curve_pair(
         "overlap_start_nm": float(comparison_wavelength[0]),
         "overlap_stop_nm": float(comparison_wavelength[-1]),
     }
+
+
+def _fit_curve_pair_by_shift_scan(
+    comparison_wavelength_nm: NDArray[np.float64],
+    control_segment: NDArray[np.float64],
+    model_wavelength_nm: NDArray[np.float64],
+    model_signal: NDArray[np.float64],
+    *,
+    max_delta_nm: float,
+    overlap_start_nm: float,
+    overlap_stop_nm: float,
+) -> dict[str, Any]:
+    if max_delta_nm <= 0.0:
+        candidate_shifts = np.asarray([0.0], dtype=float)
+    else:
+        candidate_shifts = np.linspace(-float(max_delta_nm), float(max_delta_nm), 41)
+
+    best_result: dict[str, Any] | None = None
+    normalization = max(float(np.ptp(control_segment)), 1e-6)
+    for delta in candidate_shifts:
+        shifted_model = np.interp(
+            comparison_wavelength_nm + float(delta),
+            model_wavelength_nm,
+            model_signal,
+        )
+        if not np.all(np.isfinite(shifted_model)):
+            continue
+
+        scale, offset = _fit_affine(shifted_model, control_segment)
+        fitted_signal = scale * shifted_model + offset
+        residual_vector = control_segment - fitted_signal
+        rmse = float(np.sqrt(np.mean(np.square(residual_vector))))
+        correlation = _pearson_correlation(control_segment, fitted_signal)
+        if not all(np.isfinite(value) for value in (scale, offset, rmse, correlation)):
+            continue
+
+        candidate = {
+            "valid": True,
+            "fit_cost": float(rmse / normalization),
+            "rmse": rmse,
+            "correlation": correlation,
+            "scale": float(scale),
+            "offset": float(offset),
+            "wavelength_shift_nm": float(delta),
+            "overlap_start_nm": float(comparison_wavelength_nm[0]),
+            "overlap_stop_nm": float(comparison_wavelength_nm[-1]),
+        }
+        if best_result is None or float(candidate["fit_cost"]) < float(best_result["fit_cost"]):
+            best_result = candidate
+
+    if best_result is None:
+        return _invalid_fit_result(overlap_start_nm, overlap_stop_nm)
+    return best_result
 
 
 def _estimate_initial_shift_nm(
